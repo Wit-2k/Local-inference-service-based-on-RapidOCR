@@ -1,0 +1,12 @@
+[project]
+name = "pure-onnx"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "onnxruntime>=1.24.4",
+    "opencv-python>=4.13.0.92",
+    "openvino>=2026.1.0",
+    "rapidocr>=3.8.0",
+]
