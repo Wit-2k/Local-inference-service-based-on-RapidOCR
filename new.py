@@ -2,18 +2,20 @@ import json
 import time
 
 import cv2
-from rapidocr import EngineType, LangDet, LangRec, ModelType, OCRVersion, RapidOCR
+from rapidocr import EngineType, LangDet, LangRec, OCRVersion, RapidOCR
+
+from config import LIMIT_SIDE_LEN, MODEL_TYPE
 
 engine = RapidOCR(
     params={
         "Det.engine_type": EngineType.OPENVINO,
         "Det.lang_type": LangDet.CH,
-        "Det.model_type": ModelType.MOBILE,
+        "Det.model_type": MODEL_TYPE,
         "Det.ocr_version": OCRVersion.PPOCRV5,
-        "Det.limit_side_len": 480,
+        "Det.limit_side_len": LIMIT_SIDE_LEN,
         "Rec.engine_type": EngineType.OPENVINO,
         "Rec.lang_type": LangRec.CH,
-        "Rec.model_type": ModelType.MOBILE,
+        "Rec.model_type": MODEL_TYPE,
         "Rec.ocr_version": OCRVersion.PPOCRV5,
     }
 )
