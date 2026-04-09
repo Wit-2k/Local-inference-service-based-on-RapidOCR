@@ -6,6 +6,37 @@ from rapidocr import EngineType, LangDet, LangRec, OCRVersion, RapidOCR
 
 from config import LIMIT_SIDE_LEN, MODEL_TYPE
 
+
+def save_to_json(result):
+    """
+    提取 RapidOCR 返回结果中的 boxes 和 txts 字段，加上推理时间，将三者保存为 result.json
+    """
+    boxes = result.boxes.tolist() if result.boxes is not None else []
+    txts = list(result.txts) if result.txts is not None else []
+    scores = (
+        list(result.scores)
+        if hasattr(result, "scores") and result.scores is not None
+        else [None] * len(txts)
+    )
+
+    records = [
+        {
+            "box": box,
+            "text": txt,
+            "score": round(float(score), 6) if score is not None else None,
+        }
+        for box, txt, score in zip(boxes, txts, scores)
+    ]
+
+    output = {
+        "inference_time_ms": round(elapsed_ms, 2),
+        "result": records,
+    }
+
+    with open("result.json", "w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+
+
 engine = RapidOCR(
     params={
         "Det.engine_type": EngineType.OPENVINO,
@@ -34,30 +65,6 @@ print(f"推理时间: {elapsed_ms:.2f} ms")
 
 result.vis("vis_result.jpg")
 
-# 构建结构化结果
-boxes = result.boxes.tolist() if result.boxes is not None else []
-txts = list(result.txts) if result.txts is not None else []
-scores = (
-    list(result.scores)
-    if hasattr(result, "scores") and result.scores is not None
-    else [None] * len(txts)
-)
-
-records = [
-    {
-        "box": box,
-        "text": txt,
-        "score": round(float(score), 6) if score is not None else None,
-    }
-    for box, txt, score in zip(boxes, txts, scores)
-]
-
-output = {
-    "inference_time_ms": round(elapsed_ms, 2),
-    "result": records,
-}
-
-with open("result.json", "w", encoding="utf-8") as f:
-    json.dump(output, f, ensure_ascii=False, indent=2)
+save_to_json(result)
 
 print("结果已保存至 result.json")
