@@ -10,10 +10,9 @@ from rapidocr import EngineType, LangDet, LangRec, OCRVersion, RapidOCR
 from config import LIMIT_SIDE_LEN, MODEL_TYPE
 
 # ── 全局引擎，启动时加载一次 ──────────────────────────────────
-engine: RapidOCR | None = None
+engine: RapidOCR | None = None # 单例模式
 
-
-@asynccontextmanager
+@asynccontextmanager # 不写样板类
 async def lifespan(app: FastAPI):
     # 启动时加载模型
     global engine
@@ -41,11 +40,11 @@ app = FastAPI(lifespan=lifespan)
 
 
 @app.post("/ocr")
-async def ocr(file: UploadFile = File(...)):
+async def ocr(file: UploadFile = File(...)): 
     """
     接收上传的图片文件，返回 OCR 识别结果。
 
-    返回 JSON 格式:
+    返回 JSON 示例:
     {
         "inference_time_ms": 123.45,
         "result": [
@@ -56,10 +55,12 @@ async def ocr(file: UploadFile = File(...)):
             }
         ]
     }
+    
+    file 参数为必填项，无默认值
     """
     if engine is None:
         return JSONResponse(
-            status_code=503,
+            status_code=503, # Service Unavailable
             content={"error": "OCR 引擎尚未就绪"},
         )
 
@@ -71,16 +72,16 @@ async def ocr(file: UploadFile = File(...)):
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
     if img is None:
         return JSONResponse(
-            status_code=400,
+            status_code=400, # Bad Request
             content={"error": "无法解码图片，请确认上传的是有效的图片文件"},
         )
 
-    # 推理计时
+    # 推理计时，最后要删除
     start_time = time.perf_counter()
     result = engine(img)
     end_time = time.perf_counter()
 
-    elapsed_ms = (end_time - start_time) * 1000
+    elapsed_ms = (end_time - start_time) * 1000 # 单位为毫秒
 
     # 构建结构化结果
     boxes = result.boxes.tolist() if result.boxes is not None else []
