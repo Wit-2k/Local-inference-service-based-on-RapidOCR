@@ -9,6 +9,10 @@ wheels/
 # Virtual environments
 .venv/
 
+frames/
+archived/
+description/
+
 *.onnx
 *.txt
 *.jpg

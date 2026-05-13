@@ -1,4 +1,4 @@
-# 基于 RapidOCR 的本地推理服务
+﻿# 基于 RapidOCR 的本地推理服务
 
 ### 初衷
 
@@ -14,15 +14,16 @@ PaddleOCR 的部署十分麻烦且极易失败，因此选择 RapidOCR 封装的
 
 ### 项目结构
 
-`server.py` 为具体的后端服务，。
+`ocr_server.py` 为 OCR FastAPI 后端服务。
 
 `config.py` 为配置文件，指定 `MODEL_TYPE` `LIMIT_SIDE_LEN` 两项参数。
 
-`call.py` 为调用文件，本地服务监听 8000 端口.
+`ocr_client.py` 为 OCR 请求客户端，可启动/检测本地 8000 端口服务并提交图片识别。
 
 
 
 ### 目前的问题
 
-准确率高度依赖 SERVER 模型，MOBILE 模型应用场景十分有限。
+准确率高度依赖 SERVER 模型，MOBILE 模型应用场景十分有限。但 SERVER 模型对手机直出相片的识别时间极长，实时场景下不可用。
+
 
