@@ -1,45 +1,107 @@
 import os
 import time
+from dataclasses import dataclass
+from pathlib import Path
 
 import cv2
+import numpy as np
 
-os.makedirs("frames", exist_ok=True)
+FRAME_DIR = Path("frames")
+DEFAULT_CAMERA_INDEX = 0
+DEFAULT_FRAME_WIDTH = 2560
+DEFAULT_FRAME_HEIGHT = 1440
+DEFAULT_CAPTURE_INTERVAL_SECONDS = 1.0
 
-# 目前一次只能识别一个芯片
 
-if __name__ == "__main__":
-    cap = cv2.VideoCapture(0)  # 0 通常表示默认摄像头
+@dataclass(frozen=True)
+class CameraInfo:
+    width: float
+    height: float
+    fps: float
 
+
+def ensure_frame_dir(frame_dir: str | Path = FRAME_DIR) -> Path:
+    path = Path(frame_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def open_camera(
+    camera_index: int = DEFAULT_CAMERA_INDEX,
+    width: int = DEFAULT_FRAME_WIDTH,
+    height: int = DEFAULT_FRAME_HEIGHT,
+) -> cv2.VideoCapture:
+    cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
-        print("无法打开摄像头")
-        exit()
+        raise RuntimeError("无法打开摄像头")
 
-    # 用最高分辨率保证识别成功
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    return cap
 
-    width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-    height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-    fps = cap.get(cv2.CAP_PROP_FPS)
 
-    print("当前宽度:", width)
-    print("当前高度:", height)
-    print("当前帧率:", fps)
+def get_camera_info(cap: cv2.VideoCapture) -> CameraInfo:
+    return CameraInfo(
+        width=cap.get(cv2.CAP_PROP_FRAME_WIDTH),
+        height=cap.get(cv2.CAP_PROP_FRAME_HEIGHT),
+        fps=cap.get(cv2.CAP_PROP_FPS),
+    )
 
-    last_save_time = 0
+
+def read_frame(cap: cv2.VideoCapture) -> np.ndarray:
+    ret, frame = cap.read()
+    if not ret:
+        raise RuntimeError("读取画面失败")
+    return frame
+
+
+def save_frame(frame: np.ndarray, frame_dir: str | Path = FRAME_DIR) -> Path:
+    ensure_frame_dir(frame_dir)
+    filename = time.strftime("%Y%m%d_%H%M%S.jpg")
+    frame_path = Path(frame_dir) / filename
+    if not cv2.imwrite(str(frame_path), frame):
+        raise RuntimeError(f"保存截图失败: {frame_path}")
+    return frame_path
+
+
+def bgr_to_rgb(frame: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+
+def rgb_to_bgr(frame: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+
+
+def capture_frame(
+    cap: cv2.VideoCapture,
+    frame_dir: str | Path = FRAME_DIR,
+    save: bool = True,
+) -> tuple[np.ndarray, Path | None]:
+    frame = read_frame(cap)
+    frame_path = save_frame(frame, frame_dir) if save else None
+    return frame, frame_path
+
+
+def main() -> None:
+    os.makedirs(FRAME_DIR, exist_ok=True)
+
+    # 目前一次只能识别一个芯片
+    cap = open_camera()
+
+    info = get_camera_info(cap)
+    print("当前宽度:", info.width)
+    print("当前高度:", info.height)
+    print("当前帧率:", info.fps)
+
+    last_save_time = 0.0
 
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("读取画面失败")
-                break
-
+            frame = read_frame(cap)
             now = time.time()
 
-            if now - last_save_time >= 1:
-                filename = time.strftime("frames/%Y%m%d_%H%M%S.jpg")
-                cv2.imwrite(filename, frame)
+            if now - last_save_time >= DEFAULT_CAPTURE_INTERVAL_SECONDS:
+                filename = save_frame(frame)
                 print(f"保存:{filename}")
                 last_save_time = now
 
@@ -50,6 +112,10 @@ if __name__ == "__main__":
                 break
     except KeyboardInterrupt:
         print("❌ 被手动打断")
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
 
-    cap.release()
-    cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
