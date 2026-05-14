@@ -2,6 +2,7 @@ import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 import cv2
 import numpy as np
@@ -11,6 +12,7 @@ DEFAULT_CAMERA_INDEX = 0
 DEFAULT_FRAME_WIDTH = 2560
 DEFAULT_FRAME_HEIGHT = 1440
 DEFAULT_CAPTURE_INTERVAL_SECONDS = 1.0
+DEFAULT_FRAME_RETENTION_SECONDS = 10 * 60
 
 
 @dataclass(frozen=True)
@@ -55,6 +57,31 @@ def read_frame(cap: cv2.VideoCapture) -> np.ndarray:
     return frame
 
 
+def iter_frame_files(frame_dir: str | Path = FRAME_DIR) -> Iterable[Path]:
+    path = Path(frame_dir)
+    if not path.exists():
+        return []
+    return path.glob("*.jpg")
+
+
+def cleanup_old_frames(
+    frame_dir: str | Path = FRAME_DIR,
+    retention_seconds: float = DEFAULT_FRAME_RETENTION_SECONDS,
+    now: float | None = None,
+) -> int:
+    """删除超过保留时间的截图，避免 frames/ 无限增长。"""
+    current_time = time.time() if now is None else now
+    removed_count = 0
+    for frame_path in iter_frame_files(frame_dir):
+        try:
+            if current_time - frame_path.stat().st_mtime > retention_seconds:
+                frame_path.unlink()
+                removed_count += 1
+        except OSError:
+            continue
+    return removed_count
+
+
 def save_frame(frame: np.ndarray, frame_dir: str | Path = FRAME_DIR) -> Path:
     ensure_frame_dir(frame_dir)
     filename = time.strftime("%Y%m%d_%H%M%S.jpg")
@@ -94,6 +121,7 @@ def main() -> None:
     print("当前帧率:", info.fps)
 
     last_save_time = 0.0
+    last_cleanup_time = 0.0
 
     try:
         while True:
@@ -104,6 +132,12 @@ def main() -> None:
                 filename = save_frame(frame)
                 print(f"保存:{filename}")
                 last_save_time = now
+
+            if now - last_cleanup_time >= DEFAULT_FRAME_RETENTION_SECONDS:
+                removed_count = cleanup_old_frames(now=now)
+                if removed_count:
+                    print(f"清理旧截图:{removed_count} 张")
+                last_cleanup_time = now
 
             # 如果不需要预览，可以删掉下面这几行
             cv2.imshow("camera", frame)

@@ -1,12 +1,15 @@
-'''
-本文件为预处理，从原图片中分割出芯片，不一定能压缩推理时间，但能保证多目标识别率
-'''
+"""
+本文件为预处理，从原图中分割出各个芯片，目的是保证多目标识别率
+使用 OpenCV 库实现的纯视觉方案而非 YOLO，目的是压缩处理时间
+"""
+
 from pathlib import Path
+
 import cv2
 import numpy as np
 
 
-def to_gray(image: np.ndarray, input_color: str = 'rgb') -> np.ndarray:
+def to_gray(image: np.ndarray, input_color: str = "rgb") -> np.ndarray:
     """
     灰度化函数
     - input_color='rgb': 输入按RGB三通道解释
@@ -14,7 +17,7 @@ def to_gray(image: np.ndarray, input_color: str = 'rgb') -> np.ndarray:
     - 已经是单通道时直接返回
     """
     if image is None or image.size == 0:
-        raise ValueError('输入图像为空')
+        raise ValueError("输入图像为空")
 
     # 已是灰度图
     if image.ndim == 2:
@@ -25,15 +28,16 @@ def to_gray(image: np.ndarray, input_color: str = 'rgb') -> np.ndarray:
         return image[:, :, 0]
 
     if image.ndim != 3 or image.shape[2] != 3:
-        raise ValueError(f'不支持的图像形状: {image.shape}')
+        raise ValueError(f"不支持的图像形状: {image.shape}")
 
     mode = input_color.lower()
-    if mode == 'rgb':
+    if mode == "rgb":
         return cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-    if mode == 'bgr':
+    if mode == "bgr":
         return cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
     raise ValueError("input_color 仅支持 'rgb' 或 'bgr'")
+
 
 def clahe_enhance(
     gray: np.ndarray,
@@ -50,18 +54,16 @@ def clahe_enhance(
         增强后的灰度图（uint8）
     """
     if gray is None or gray.size == 0:
-        raise ValueError('输入灰度图为空')
+        raise ValueError("输入灰度图为空")
     if gray.ndim != 2:
-        raise ValueError('clahe_enhance 仅支持单通道灰度图')
+        raise ValueError("clahe_enhance 仅支持单通道灰度图")
     if gray.dtype != np.uint8:
         gray = np.clip(gray, 0, 255).astype(np.uint8)
 
-    clahe = cv2.createCLAHE(
-        clipLimit=clip_limit,
-        tileGridSize=tile_grid_size
-    )
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid_size)
     enhanced = clahe.apply(gray)
     return enhanced
+
 
 def binarize(gray: np.ndarray) -> np.ndarray:
     """
@@ -70,7 +72,7 @@ def binarize(gray: np.ndarray) -> np.ndarray:
     2) 反色，让芯片(黑色区域)在二值图中变为白色，便于后续轮廓检测
     """
     if gray is None or gray.size == 0:
-        raise ValueError('输入灰度图为空')
+        raise ValueError("输入灰度图为空")
 
     # OTSU 二值化（先得到“亮=白，暗=黑”）
     _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
@@ -85,7 +87,7 @@ def denoise(binary_img: np.ndarray) -> np.ndarray:
     降噪：开运算去小白点，闭运算填小孔洞
     """
     if binary_img is None or binary_img.size == 0:
-        raise ValueError('输入二值图为空')
+        raise ValueError("输入二值图为空")
 
     kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
@@ -103,9 +105,11 @@ def find_largest_chip_rect(cleaned_binary: np.ndarray, min_area_ratio: float = 0
     h, w = cleaned_binary.shape[:2]
     img_area = float(h * w)
 
-    contours, _ = cv2.findContours(cleaned_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contours, _ = cv2.findContours(
+        cleaned_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
     if not contours:
-        raise RuntimeError('未检测到任何轮廓')
+        raise RuntimeError("未检测到任何轮廓")
 
     best_rect = None
     best_area = 0.0
@@ -139,10 +143,10 @@ def find_largest_chip_rect(cleaned_binary: np.ndarray, min_area_ratio: float = 0
 
 
 def segment(
-    image_path: str = 'input.jpg',
-    output_path: str = 'chip_crop.jpg',
+    image_path: str = "input.jpg",
+    output_path: str = "chip_crop.jpg",
     debug: bool = True,
-    input_color: str = 'rgb',
+    input_color: str = "rgb",
 ):
     """
     从图中分割出最大的黑色矩形（芯片）并保存
@@ -153,7 +157,7 @@ def segment(
 
     src = cv2.imread(image_path)
     if src is None:
-        raise FileNotFoundError(f'无法读取图片: {image_path}')
+        raise FileNotFoundError(f"无法读取图片: {image_path}")
 
     # 注意：若你的数据是RGB排列，请使用 input_color='rgb'
     gray = to_gray(src, input_color=input_color)
@@ -175,14 +179,14 @@ def segment(
     w = max(1, min(w, W - x))
     h = max(1, min(h, H - y))
 
-    chip = src[y:y + h, x:x + w]
+    chip = src[y : y + h, x : x + w]
 
     # 保存结果
     out_dir = Path(output_path).parent
     out_dir.mkdir(parents=True, exist_ok=True)
     ok = cv2.imwrite(output_path, chip)
     if not ok:
-        raise RuntimeError(f'保存失败: {output_path}')
+        raise RuntimeError(f"保存失败: {output_path}")
 
     if debug:
         # 画框调试图
@@ -190,10 +194,10 @@ def segment(
         cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 0, 255), 2)
 
         stem = Path(output_path).stem
-        suffix = Path(output_path).suffix or '.jpg'
-        debug_bin = str(Path(output_path).with_name(f'{stem}_binary{suffix}'))
-        debug_clean = str(Path(output_path).with_name(f'{stem}_clean{suffix}'))
-        debug_box = str(Path(output_path).with_name(f'{stem}_box{suffix}'))
+        suffix = Path(output_path).suffix or ".jpg"
+        debug_bin = str(Path(output_path).with_name(f"{stem}_binary{suffix}"))
+        debug_clean = str(Path(output_path).with_name(f"{stem}_clean{suffix}"))
+        debug_box = str(Path(output_path).with_name(f"{stem}_box{suffix}"))
 
         cv2.imwrite(debug_bin, bw)
         cv2.imwrite(debug_clean, cleaned)
@@ -202,6 +206,6 @@ def segment(
     return chip, (x, y, w, h)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     # 测试图为RGB时，传入 input_color='rgb'
-    segment('sample.jpg', 'chip_crop.jpg', debug=True, input_color='rgb')
+    segment(R"images\good.jpg", "chip_crop.jpg", debug=True, input_color="rgb")

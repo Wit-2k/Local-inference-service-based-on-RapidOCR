@@ -1,6 +1,7 @@
 """OCR 服务进程管理与请求客户端。"""
 
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -14,7 +15,27 @@ import requests
 
 from ocr_server import APP_IMPORT_PATH
 
-BASE_URL = "http://localhost:8000"
+LOCAL_PROXY_BYPASS = "localhost,127.0.0.1,::1"
+
+
+def configure_local_proxy_bypass() -> None:
+    bypass_hosts = LOCAL_PROXY_BYPASS.split(",")
+    for env_key in ("NO_PROXY", "no_proxy"):
+        values = [
+            value.strip()
+            for value in os.environ.get(env_key, "").split(",")
+            if value.strip()
+        ]
+        for host in bypass_hosts:
+            if host not in values:
+                values.append(host)
+        os.environ[env_key] = ",".join(values)
+
+
+configure_local_proxy_bypass()
+
+
+BASE_URL = "http://127.0.0.1:8000"
 HEALTH_URL = f"{BASE_URL}/health"
 OCR_URL = f"{BASE_URL}/ocr"
 SHUTDOWN_URL = f"{BASE_URL}/shutdown"
@@ -76,7 +97,9 @@ def start_server(host: str = "0.0.0.0", port: int = PORT) -> subprocess.Popen:
     return subprocess.Popen(command, **process_options)
 
 
-def ensure_ocr_service(max_retries: int = 60, interval: float = 1.0) -> subprocess.Popen | None:
+def ensure_ocr_service(
+    max_retries: int = 60, interval: float = 1.0
+) -> subprocess.Popen | None:
     """确保 OCR 服务运行；新启动时返回进程句柄，已有服务则返回 None。"""
     if is_port_in_use(PORT):
         if wait_for_server(max_retries=1, interval=interval):
@@ -116,7 +139,9 @@ def request_server_shutdown(timeout: float = 2.0) -> bool:
     return True
 
 
-def save_result(result: dict[str, Any], save_path: str | Path | None = RESULT_PATH) -> None:
+def save_result(
+    result: dict[str, Any], save_path: str | Path | None = RESULT_PATH
+) -> None:
     """按 result.json 的结构保存最近一次 OCR 结果。"""
     if save_path is None:
         return
@@ -191,12 +216,20 @@ def recognize(image_url: str | Path) -> dict[str, Any]:
 
 def main() -> None:
     process: subprocess.Popen | None = None
-    image_path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("angled.jpg")
+    image_path = (
+        Path(sys.argv[1]) if len(sys.argv) > 1 else Path("images/chip_crop.jpg")
+    )
     try:
         process = ensure_ocr_service()
         result = recognize(image_path)
         print(json.dumps(result, ensure_ascii=False, indent=2))
-    except (OSError, RuntimeError, TimeoutError, ValueError, requests.RequestException) as exc:
+    except (
+        OSError,
+        RuntimeError,
+        TimeoutError,
+        ValueError,
+        requests.RequestException,
+    ) as exc:
         print(f"❌ OCR 调用失败: {exc}")
         sys.exit(1)
     finally:

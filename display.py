@@ -1,8 +1,8 @@
 """Gradio 摄像头实时 OCR 展示页。"""
 
+import os
 import subprocess
 import threading
-import time
 from typing import Any
 
 import cv2
@@ -15,7 +15,6 @@ from capture import (
     DEFAULT_CAPTURE_INTERVAL_SECONDS,
     DEFAULT_FRAME_HEIGHT,
     DEFAULT_FRAME_WIDTH,
-    FRAME_DIR,
     bgr_to_rgb,
     capture_frame,
     get_camera_info,
@@ -29,6 +28,28 @@ from ocr_client import (
     shutdown_server,
 )
 
+LOCAL_PROXY_BYPASS = "localhost,127.0.0.1,::1"
+
+
+def configure_local_proxy_bypass() -> None:
+    bypass_hosts = LOCAL_PROXY_BYPASS.split(",")
+    for env_key in ("NO_PROXY", "no_proxy"):
+        values = [
+            value.strip()
+            for value in os.environ.get(env_key, "").split(",")
+            if value.strip()
+        ]
+        for host in bypass_hosts:
+            if host not in values:
+                values.append(host)
+        os.environ[env_key] = ",".join(values)
+
+
+configure_local_proxy_bypass()
+
+
+GRADIO_SERVER_NAME = "127.0.0.1"
+GRADIO_SERVER_PORT = 7860
 APP_CSS = """
 .gradio-container {
     background:
@@ -133,11 +154,9 @@ def stop_camera() -> tuple[bool, str, Any, Any, Any]:
     return False, "ℹ️ 摄像头未运行", None, gr.update(), gr.update()
 
 
-def format_result(result: dict[str, Any], frame_path: str | None) -> str:
+def format_result(result: dict[str, Any]) -> str:
     """按 result.json 的结构格式化识别结果。"""
     lines = [f"推理耗时：{result.get('inference_time_ms', 0)} ms"]
-    if frame_path:
-        lines.append(f"截图：{frame_path}")
 
     items = result.get("result") or []
     if not items:
@@ -162,18 +181,20 @@ def draw_boxes(image: np.ndarray, result: dict[str, Any]) -> np.ndarray:
         if not box:
             continue
         points = np.array(box, dtype=np.int32).reshape((-1, 1, 2))
-        cv2.polylines(annotated, [points], isClosed=True, color=(0, 255, 0), thickness=2)
+        cv2.polylines(
+            annotated, [points], isClosed=True, color=(0, 255, 0), thickness=2
+        )
     return annotated
 
 
 def capture_and_recognize(enabled: bool) -> tuple[Any, Any, str, dict[str, Any]]:
-    """用 capture.py 的 OpenCV 截图方式抓取一帧并送 OCR。"""
+    """用 capture.py 的 OpenCV 取帧方式抓取一帧并直接送 OCR。"""
     with camera_lock:
         if camera_capture is None or not camera_capture.isOpened():
             return None, gr.update(), "等待启动摄像头...", {}
 
         try:
-            frame_bgr, frame_path = capture_frame(camera_capture, frame_dir=FRAME_DIR, save=True)
+            frame_bgr, _ = capture_frame(camera_capture, save=False)
         except RuntimeError as exc:
             return None, gr.update(), f"❌ {exc}", {}
 
@@ -185,11 +206,17 @@ def capture_and_recognize(enabled: bool) -> tuple[Any, Any, str, dict[str, Any]]
         if not is_ocr_ready():
             start_background_service()
         result = recognize_array(frame_rgb)
-    except (RuntimeError, ValueError, requests.RequestException, TimeoutError, OSError) as exc:
+    except (
+        RuntimeError,
+        ValueError,
+        requests.RequestException,
+        TimeoutError,
+        OSError,
+    ) as exc:
         return frame_rgb, gr.update(), f"❌ 识别失败：{exc}", {}
 
     annotated = draw_boxes(frame_rgb, result)
-    return frame_rgb, annotated, format_result(result, str(frame_path)), result
+    return frame_rgb, annotated, format_result(result), result
 
 
 def set_recognition_enabled(enabled: bool) -> tuple[bool, str]:
@@ -200,7 +227,9 @@ def set_recognition_enabled(enabled: bool) -> tuple[bool, str]:
     return False, "⏸️ 实时识别已暂停，后台服务仍保持运行。"
 
 
-def initialize_app(camera_index: int, width: int, height: int) -> tuple[bool, bool, str]:
+def initialize_app(
+    camera_index: int, width: int, height: int
+) -> tuple[bool, bool, str]:
     service_message = start_background_service()
     camera_enabled, camera_message = start_camera(camera_index, width, height)
     return True, camera_enabled, f"{service_message}\n{camera_message}"
@@ -214,7 +243,8 @@ def build_demo() -> gr.Blocks:
 
         gr.Markdown(
             "# 实时 OCR 摄像头识别\n"
-            "页面按 `capture.py` 的 OpenCV 方式打开本机摄像头，以高分辨率定时截图，保存到 `frames/` 并送 OCR。"
+            "页面运行在 `127.0.0.1:7860`，OCR 服务运行在 `127.0.0.1:8000`。"
+            "页面按 `capture.py` 的 OpenCV 方式打开本机摄像头，以高分辨率取帧并直接在内存中送 OCR。"
         )
 
         with gr.Row():
@@ -248,7 +278,9 @@ def build_demo() -> gr.Blocks:
             pause_button = gr.Button("暂停实时识别")
             stop_service_button = gr.Button("停止 OCR 服务", variant="stop")
 
-        status = gr.Textbox(label="状态", value="正在启动 OCR 服务和摄像头...", interactive=False)
+        status = gr.Textbox(
+            label="状态", value="正在启动 OCR 服务和摄像头...", interactive=False
+        )
         result_text = gr.Textbox(label="识别结果", lines=8, interactive=False)
         result_json = gr.JSON(label="result.json 同构数据")
 
@@ -264,7 +296,13 @@ def build_demo() -> gr.Blocks:
         )
         stop_camera_button.click(
             stop_camera,
-            outputs=[camera_enabled_state, status, frame_preview, result_text, result_json],
+            outputs=[
+                camera_enabled_state,
+                status,
+                frame_preview,
+                result_text,
+                result_json,
+            ],
         )
         start_button.click(
             lambda: set_recognition_enabled(True),
@@ -274,7 +312,9 @@ def build_demo() -> gr.Blocks:
             lambda: set_recognition_enabled(False),
             outputs=[enabled_state, status],
         )
-        stop_service_button.click(stop_background_service, outputs=[status, enabled_state])
+        stop_service_button.click(
+            stop_background_service, outputs=[status, enabled_state]
+        )
         timer.tick(
             capture_and_recognize,
             inputs=[enabled_state],
@@ -289,4 +329,9 @@ demo = build_demo()
 
 
 if __name__ == "__main__":
-    demo.launch(css=APP_CSS)
+    demo.launch(
+        server_name=GRADIO_SERVER_NAME,
+        server_port=GRADIO_SERVER_PORT,
+        share=False,
+        css=APP_CSS,
+    )
