@@ -1,4 +1,11 @@
-"""Gradio 摄像头实时 OCR 展示页。"""
+"""
+Gradio 摄像头实时 OCR 展示页。
+
+操作流程：
+1. 点击 Click to Access Webcam
+2. 点击“开始实时识别”
+3. 点击“录制”
+"""
 
 import os
 import subprocess
@@ -11,14 +18,9 @@ import numpy as np
 import requests
 
 from capture import (
-    DEFAULT_CAMERA_INDEX,
     DEFAULT_CAPTURE_INTERVAL_SECONDS,
     DEFAULT_FRAME_HEIGHT,
     DEFAULT_FRAME_WIDTH,
-    bgr_to_rgb,
-    get_camera_info,
-    open_camera,
-    read_frame,
 )
 from ocr_client import (
     ensure_ocr_service,
@@ -51,7 +53,13 @@ configure_local_proxy_bypass()
 GRADIO_SERVER_NAME = "127.0.0.1"
 GRADIO_SERVER_PORT = 7860
 RAW_CAMERA_FPS = 30.0
-RAW_CAMERA_INTERVAL_SECONDS = 1.0 / RAW_CAMERA_FPS
+WEBCAM_CONSTRAINTS = {
+    "video": {
+        "width": {"ideal": DEFAULT_FRAME_WIDTH},
+        "height": {"ideal": DEFAULT_FRAME_HEIGHT},
+        "frameRate": {"ideal": RAW_CAMERA_FPS, "max": RAW_CAMERA_FPS},
+    }
+}
 APP_CSS = """
 .gradio-container {
     background:
@@ -77,8 +85,6 @@ textarea, .json-holder {
 
 server_process: subprocess.Popen | None = None
 server_lock = threading.Lock()
-camera_lock = threading.Lock()
-camera_capture: cv2.VideoCapture | None = None
 
 
 def start_background_service() -> str:
@@ -116,47 +122,6 @@ def stop_background_service() -> tuple[str, bool]:
     return "ℹ️ OCR 服务未运行", False
 
 
-def start_camera(
-    camera_index: int,
-    width: int,
-    height: int,
-) -> tuple[bool, str]:
-    """按 capture.py 的方式打开本机摄像头并设置高分辨率。"""
-    global camera_capture
-    with camera_lock:
-        if camera_capture is not None and camera_capture.isOpened():
-            camera_capture.release()
-            camera_capture = None
-
-        try:
-            camera_capture = open_camera(
-                camera_index=int(camera_index),
-                width=int(width),
-                height=int(height),
-            )
-            camera_capture.set(cv2.CAP_PROP_FPS, RAW_CAMERA_FPS)
-            info = get_camera_info(camera_capture)
-        except RuntimeError as exc:
-            camera_capture = None
-            return False, f"❌ {exc}"
-
-    return (
-        True,
-        f"📷 摄像头已打开：{info.width:.0f} x {info.height:.0f}, FPS {info.fps:.1f}",
-    )
-
-
-def stop_camera() -> tuple[bool, str, Any, Any, Any]:
-    """释放本机摄像头。"""
-    global camera_capture
-    with camera_lock:
-        if camera_capture is not None:
-            camera_capture.release()
-            camera_capture = None
-            return False, "📷 摄像头已停止", None, gr.update(), gr.update()
-    return False, "ℹ️ 摄像头未运行", None, gr.update(), gr.update()
-
-
 def format_result(result: dict[str, Any]) -> str:
     """按 result.json 的结构格式化识别结果。"""
     lines = [f"推理耗时：{result.get('inference_time_ms', 0)} ms"]
@@ -190,32 +155,13 @@ def draw_boxes(image: np.ndarray, result: dict[str, Any]) -> np.ndarray:
     return annotated
 
 
-def read_raw_camera_frame() -> Any:
-    """读取摄像头原始帧，供 30fps 预览使用。"""
-    with camera_lock:
-        if camera_capture is None or not camera_capture.isOpened():
-            return None
+def recognize_stream_frame(
+    enabled: bool, frame_rgb: np.ndarray | None
+) -> tuple[Any, str, dict[str, Any]]:
+    """识别浏览器 WebRTC 摄像头流抽取的当前帧。"""
+    if frame_rgb is None:
+        return gr.update(), "等待浏览器摄像头画面...", {}
 
-        try:
-            frame_bgr = read_frame(camera_capture)
-        except RuntimeError:
-            return None
-
-    return bgr_to_rgb(frame_bgr)
-
-
-def capture_and_recognize(enabled: bool) -> tuple[Any, str, dict[str, Any]]:
-    """用 capture.py 的 OpenCV 取帧方式抓取一帧并直接送 OCR。"""
-    with camera_lock:
-        if camera_capture is None or not camera_capture.isOpened():
-            return gr.update(), "等待启动摄像头...", {}
-
-        try:
-            frame_bgr = read_frame(camera_capture)
-        except RuntimeError as exc:
-            return gr.update(), f"❌ {exc}", {}
-
-    frame_rgb = bgr_to_rgb(frame_bgr)
     if not enabled:
         return gr.update(), "OCR 已暂停，摄像头原始流仍在更新。", {}
 
@@ -244,83 +190,49 @@ def set_recognition_enabled(enabled: bool) -> tuple[bool, str]:
     return False, "⏸️ 实时识别已暂停，后台服务仍保持运行。"
 
 
-def initialize_app(
-    camera_index: int, width: int, height: int
-) -> tuple[bool, bool, str]:
+def initialize_app() -> tuple[bool, str]:
     service_message = start_background_service()
-    camera_enabled, camera_message = start_camera(camera_index, width, height)
-    return True, camera_enabled, f"{service_message}\n{camera_message}"
+    return True, f"{service_message}\n📷 请在摄像头原始流中允许浏览器访问摄像头"
 
 
 def build_demo() -> gr.Blocks:
     with gr.Blocks(title="实时 OCR 摄像头识别") as demo:
         enabled_state = gr.State(True)
-        camera_enabled_state = gr.State(False)
-        raw_stream_timer = gr.Timer(value=RAW_CAMERA_INTERVAL_SECONDS, active=True)
-        ocr_timer = gr.Timer(value=DEFAULT_CAPTURE_INTERVAL_SECONDS, active=True)
 
         gr.Markdown(
             "# 实时 OCR 摄像头识别\n"
             "页面运行在 `127.0.0.1:7860`，OCR 服务运行在 `127.0.0.1:8000`。"
-            "页面按 `capture.py` 的 OpenCV 方式打开本机摄像头，以高分辨率取帧并直接在内存中送 OCR。"
+            "页面使用浏览器摄像头原始流预览，并按固定间隔抽帧送 OCR。"
         )
 
         with gr.Row():
-            camera_index = gr.Number(
-                value=DEFAULT_CAMERA_INDEX,
-                label="摄像头编号",
-                precision=0,
+            frame_preview = gr.Image(
+                type="numpy",
+                label="摄像头原始流",
+                sources=["webcam"],
+                streaming=True,
                 interactive=True,
+                webcam_options=gr.WebcamOptions(
+                    mirror=False,
+                    constraints=WEBCAM_CONSTRAINTS,
+                ),
             )
-            frame_width = gr.Number(
-                value=DEFAULT_FRAME_WIDTH,
-                label="截图宽度",
-                precision=0,
-                interactive=True,
-            )
-            frame_height = gr.Number(
-                value=DEFAULT_FRAME_HEIGHT,
-                label="截图高度",
-                precision=0,
-                interactive=True,
-            )
-
-        with gr.Row():
-            frame_preview = gr.Image(type="numpy", label="摄像头原始流")
             annotated = gr.Image(type="numpy", label="识别框预览")
 
         with gr.Row():
-            start_camera_button = gr.Button("启动/重启摄像头", variant="primary")
-            stop_camera_button = gr.Button("停止摄像头")
             start_button = gr.Button("开启实时识别", variant="primary")
             pause_button = gr.Button("暂停实时识别")
             stop_service_button = gr.Button("停止 OCR 服务", variant="stop")
 
         status = gr.Textbox(
-            label="状态", value="正在启动 OCR 服务和摄像头...", interactive=False
+            label="状态", value="正在启动 OCR 服务...", interactive=False
         )
         result_text = gr.Textbox(label="识别结果", lines=8, interactive=False)
         result_json = gr.JSON(label="result.json 同构数据")
 
         demo.load(
             initialize_app,
-            inputs=[camera_index, frame_width, frame_height],
-            outputs=[enabled_state, camera_enabled_state, status],
-        )
-        start_camera_button.click(
-            start_camera,
-            inputs=[camera_index, frame_width, frame_height],
-            outputs=[camera_enabled_state, status],
-        )
-        stop_camera_button.click(
-            stop_camera,
-            outputs=[
-                camera_enabled_state,
-                status,
-                frame_preview,
-                result_text,
-                result_json,
-            ],
+            outputs=[enabled_state, status],
         )
         start_button.click(
             lambda: set_recognition_enabled(True),
@@ -333,16 +245,13 @@ def build_demo() -> gr.Blocks:
         stop_service_button.click(
             stop_background_service, outputs=[status, enabled_state]
         )
-        raw_stream_timer.tick(
-            read_raw_camera_frame,
-            outputs=[frame_preview],
-            concurrency_limit=1,
-        )
-        ocr_timer.tick(
-            capture_and_recognize,
-            inputs=[enabled_state],
+        frame_preview.stream(
+            recognize_stream_frame,
+            inputs=[enabled_state, frame_preview],
             outputs=[annotated, result_text, result_json],
             concurrency_limit=1,
+            show_progress="hidden",
+            stream_every=DEFAULT_CAPTURE_INTERVAL_SECONDS,
         )
 
     return demo
