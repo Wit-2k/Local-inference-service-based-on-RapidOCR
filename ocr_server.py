@@ -11,6 +11,7 @@ from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.responses import JSONResponse
 from rapidocr import EngineType, LangDet, LangRec, OCRVersion, RapidOCR
 
+from chip_preprocess import generate_chip_ocr_variants
 from config import LIMIT_SIDE_LEN, MODEL_TYPE
 
 APP_IMPORT_PATH = "ocr_server:app"
@@ -58,13 +59,47 @@ def serialize_ocr_result(result: Any, inference_time_ms: float) -> dict[str, Any
     }
 
 
-def recognize_image(img: np.ndarray) -> dict[str, Any]:
+def text_quality(payload: dict[str, Any]) -> float:
+    quality = 0.0
+    for item in payload.get("result") or []:
+        text = "".join(ch for ch in item.get("text", "") if ch.isalnum())
+        score = item.get("score") or 0.0
+        quality += len(text) * float(score)
+    return quality
+
+
+def run_ocr(img: np.ndarray) -> dict[str, Any]:
     if engine is None:
         raise RuntimeError("OCR 引擎尚未就绪")
 
     start = time.perf_counter()
     result = engine(img)
     return serialize_ocr_result(result, (time.perf_counter() - start) * 1000)
+
+
+def recognize_image(img: np.ndarray, enhance: bool = False) -> dict[str, Any]:
+    if not enhance:
+        return run_ocr(img)
+
+    start = time.perf_counter()
+    best_payload: dict[str, Any] | None = None
+    best_variant = "original"
+    best_quality = -1.0
+
+    for variant_name, variant_image in generate_chip_ocr_variants(img):
+        payload = run_ocr(variant_image)
+        quality = text_quality(payload)
+        if quality > best_quality:
+            best_payload = payload
+            best_variant = variant_name
+            best_quality = quality
+
+    if best_payload is None:
+        best_payload = {"inference_time_ms": 0.0, "result": []}
+
+    best_payload["inference_time_ms"] = round((time.perf_counter() - start) * 1000, 2)
+    best_payload["preprocess_variant"] = best_variant
+    return best_payload
 
 
 @asynccontextmanager
@@ -81,7 +116,7 @@ app = FastAPI(lifespan=lifespan)
 
 
 @app.post("/ocr")
-async def ocr(file: UploadFile = File(...)):
+async def ocr(file: UploadFile = File(...), enhance: bool = False):
     """接收上传图片，返回 OCR 识别结果"""
     if engine is None:
         return JSONResponse(status_code=503, content={"error": "OCR 引擎尚未就绪"})
@@ -90,7 +125,7 @@ async def ocr(file: UploadFile = File(...)):
     if img is None:
         return JSONResponse(status_code=400, content={"error": "无法解码图片"})
 
-    return recognize_image(img)
+    return recognize_image(img, enhance=enhance)
 
 
 @app.get("/health")

@@ -18,7 +18,21 @@ PaddleOCR 的部署十分麻烦且极易失败，因此选择 RapidOCR 封装的
 
 `display.py` 为 Gradio 实时页面，复用 `capture.py` 的 OpenCV 摄像头取帧方式，显示实时画面、OCR 检测框和 `result.json` 同构识别结果；识别过程不再保存临时截图文件。
 
+`segment.py` 为芯片分割预处理脚本，可从一张输入图中截取多个芯片；当检测到多个芯片时会输出为 `输出名_01.jpg`、`输出名_02.jpg` 等文件。
+
 `capture.py` 作为独立截图脚本运行时仍会保存截图到 `frames/`，并会定时清理旧截图，避免文件无限增加。
+
+### 分割芯片
+
+```bash
+python segment.py images/fourth.jpg chip_crop.jpg
+```
+
+默认会输出调试图；不需要调试图时可以使用：
+
+```bash
+python segment.py images/fourth.jpg chip_crop.jpg --no-debug
+```
 
 ### 启动网页
 

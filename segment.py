@@ -1,12 +1,25 @@
 """
-本文件为预处理，从原图中分割出各个芯片，目的是保证多目标识别率
-使用 OpenCV 库实现的纯视觉方案而非 YOLO，目的是压缩处理时间
+本文件为预处理，从原图中分割出各个芯片，目的是保证多目标识别率。
+使用 OpenCV 库实现的纯视觉方案而非 YOLO，目的是压缩处理时间。
 """
 
+import argparse
+import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 import cv2
 import numpy as np
+
+Rect = tuple[int, int, int, int]
+
+
+@dataclass(frozen=True)
+class ChipCandidate:
+    rect: Rect
+    score: float
+    source: str
 
 
 def to_gray(image: np.ndarray, input_color: str = "rgb") -> np.ndarray:
@@ -19,11 +32,9 @@ def to_gray(image: np.ndarray, input_color: str = "rgb") -> np.ndarray:
     if image is None or image.size == 0:
         raise ValueError("输入图像为空")
 
-    # 已是灰度图
     if image.ndim == 2:
         return image
 
-    # (H, W, 1) -> squeeze 成单通道
     if image.ndim == 3 and image.shape[2] == 1:
         return image[:, :, 0]
 
@@ -74,17 +85,14 @@ def binarize(gray: np.ndarray) -> np.ndarray:
     if gray is None or gray.size == 0:
         raise ValueError("输入灰度图为空")
 
-    # OTSU 二值化（先得到“亮=白，暗=黑”）
     _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-    # 反色：让黑色芯片区域变为白色目标区域，利于 findContours
     bw_inv = cv2.bitwise_not(bw)
     return bw_inv
 
 
 def denoise(binary_img: np.ndarray) -> np.ndarray:
     """
-    降噪：开运算去小白点，闭运算填小孔洞
+    降噪：开运算去小白点，闭运算填小孔洞。
     """
     if binary_img is None or binary_img.size == 0:
         raise ValueError("输入二值图为空")
@@ -97,115 +105,401 @@ def denoise(binary_img: np.ndarray) -> np.ndarray:
     return cleaned
 
 
-def find_largest_chip_rect(cleaned_binary: np.ndarray, min_area_ratio: float = 0.01):
-    """
-    轮廓检测，找最大的近似矩形区域
-    返回：(x, y, w, h)
-    """
-    h, w = cleaned_binary.shape[:2]
-    img_area = float(h * w)
+def auto_canny(gray: np.ndarray, sigma: float = 0.33) -> np.ndarray:
+    median = float(np.median(gray))
+    lower = int(max(0, (1.0 - sigma) * median))
+    upper = int(min(255, (1.0 + sigma) * median))
+    return cv2.Canny(gray, lower, upper)
 
-    contours, _ = cv2.findContours(
-        cleaned_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+
+def build_candidate_masks(gray: np.ndarray) -> list[tuple[str, np.ndarray]]:
+    """
+    构造多路候选掩码：
+    - dark: 暗区域阈值，适合黑色芯片主体清晰的场景
+    - edge_*: 边缘闭合，适合背景纹理导致暗区域粘连的场景
+    """
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    enhanced = clahe_enhance(blur, clip_limit=2.0, tile_grid_size=(8, 8))
+
+    dark = denoise(binarize(enhanced))
+    masks: list[tuple[str, np.ndarray]] = [("dark", dark)]
+
+    edges = auto_canny(blur)
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    for kernel_size in [(7, 7), (15, 15), (31, 15)]:
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, kernel_size)
+        closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, close_kernel, iterations=2)
+        closed = cv2.dilate(closed, close_kernel, iterations=1)
+        closed = cv2.morphologyEx(closed, cv2.MORPH_OPEN, open_kernel, iterations=1)
+        masks.append((f"edge_{kernel_size[0]}x{kernel_size[1]}", closed))
+
+    return masks
+
+
+def clip_rect(rect: Rect, image_shape: tuple[int, int]) -> Rect:
+    x, y, w, h = rect
+    image_h, image_w = image_shape[:2]
+    x = max(0, min(int(x), image_w - 1))
+    y = max(0, min(int(y), image_h - 1))
+    w = max(1, min(int(w), image_w - x))
+    h = max(1, min(int(h), image_h - y))
+    return x, y, w, h
+
+
+def pad_rect(
+    rect: Rect, image_shape: tuple[int, int], padding_ratio: float = 0.06
+) -> Rect:
+    x, y, w, h = rect
+    pad_x = int(round(w * padding_ratio))
+    pad_y = int(round(h * padding_ratio))
+    return clip_rect((x - pad_x, y - pad_y, w + 2 * pad_x, h + 2 * pad_y), image_shape)
+
+
+def rect_area(rect: Rect) -> int:
+    return rect[2] * rect[3]
+
+
+def rect_iou(rect_a: Rect, rect_b: Rect) -> float:
+    ax, ay, aw, ah = rect_a
+    bx, by, bw, bh = rect_b
+    left = max(ax, bx)
+    top = max(ay, by)
+    right = min(ax + aw, bx + bw)
+    bottom = min(ay + ah, by + bh)
+    if right <= left or bottom <= top:
+        return 0.0
+
+    intersection = (right - left) * (bottom - top)
+    union = rect_area(rect_a) + rect_area(rect_b) - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def center_border_contrast(roi: np.ndarray) -> float:
+    h, w = roi.shape[:2]
+    border_x = max(1, w // 10)
+    border_y = max(1, h // 10)
+    if h <= border_y * 2 or w <= border_x * 2:
+        return 0.0
+
+    border = np.concatenate(
+        [
+            roi[:border_y, :].ravel(),
+            roi[-border_y:, :].ravel(),
+            roi[:, :border_x].ravel(),
+            roi[:, -border_x:].ravel(),
+        ]
     )
-    if not contours:
-        raise RuntimeError("未检测到任何轮廓")
+    center = roi[border_y:-border_y, border_x:-border_x]
+    return float(border.mean() - center.mean())
 
-    best_rect = None
-    best_area = 0.0
 
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if area < img_area * min_area_ratio:
+def score_rect(gray: np.ndarray, rect: Rect) -> tuple[float, float, float, float]:
+    x, y, w, h = rect
+    roi = gray[y : y + h, x : x + w]
+    dark_threshold = float(np.percentile(gray, 35))
+    dark_ratio = float((roi < dark_threshold).mean())
+    contrast = center_border_contrast(roi)
+
+    edge_map = auto_canny(roi)
+    edge_density = float((edge_map > 0).mean())
+    contrast_score = min(max(contrast, 0.0) / 80.0, 1.0)
+    edge_score = min(edge_density * 8.0, 1.0)
+    score = 0.55 * dark_ratio + 0.35 * contrast_score + 0.10 * edge_score
+    return score, dark_ratio, contrast, edge_density
+
+
+def rect_touches_border(
+    rect: Rect, image_shape: tuple[int, int], margin_ratio: float = 0.01
+) -> bool:
+    x, y, w, h = rect
+    image_h, image_w = image_shape[:2]
+    margin_x = max(1, int(round(image_w * margin_ratio)))
+    margin_y = max(1, int(round(image_h * margin_ratio)))
+    return (
+        x <= margin_x
+        or y <= margin_y
+        or x + w >= image_w - margin_x
+        or y + h >= image_h - margin_y
+    )
+
+
+def contour_rects(mask: np.ndarray) -> Iterable[tuple[Rect, float]]:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for contour in contours:
+        contour_area = cv2.contourArea(contour)
+        if contour_area <= 0:
             continue
+        yield cv2.boundingRect(contour), contour_area
 
-        peri = cv2.arcLength(cnt, True)
-        approx = cv2.approxPolyDP(cnt, 0.02 * peri, True)
 
-        # 优先使用四边形；否则退化为外接矩形
-        if len(approx) == 4:
-            x, y, rw, rh = cv2.boundingRect(approx)
+def non_max_suppression(
+    candidates: list[ChipCandidate],
+    iou_threshold: float = 0.35,
+    containment_threshold: float = 0.75,
+) -> list[ChipCandidate]:
+    selected: list[ChipCandidate] = []
+    for candidate in sorted(candidates, key=lambda item: item.score, reverse=True):
+        candidate_area = rect_area(candidate.rect)
+        should_keep = True
+        for item in selected:
+            if rect_iou(candidate.rect, item.rect) >= iou_threshold:
+                should_keep = False
+                break
+
+            x, y, w, h = candidate.rect
+            sx, sy, sw, sh = item.rect
+            left = max(x, sx)
+            top = max(y, sy)
+            right = min(x + w, sx + sw)
+            bottom = min(y + h, sy + sh)
+            intersection = max(0, right - left) * max(0, bottom - top)
+            if (
+                candidate_area > 0
+                and intersection / candidate_area >= containment_threshold
+            ):
+                should_keep = False
+                break
+
+        if should_keep:
+            selected.append(candidate)
+    return selected
+
+
+def sort_rects_reading_order(candidates: list[ChipCandidate]) -> list[ChipCandidate]:
+    if not candidates:
+        return []
+
+    heights = [candidate.rect[3] for candidate in candidates]
+    row_tolerance = max(20, int(np.median(heights) * 0.55))
+    rows: list[list[ChipCandidate]] = []
+
+    for candidate in sorted(candidates, key=lambda item: item.rect[1]):
+        x, y, _, _ = candidate.rect
+        for row in rows:
+            row_y = int(np.mean([item.rect[1] for item in row]))
+            if abs(y - row_y) <= row_tolerance:
+                row.append(candidate)
+                break
         else:
-            x, y, rw, rh = cv2.boundingRect(cnt)
+            rows.append([candidate])
 
-        rect_area = rw * rh
-        if rect_area > best_area:
-            best_area = rect_area
-            best_rect = (x, y, rw, rh)
+    ordered: list[ChipCandidate] = []
+    for row in rows:
+        ordered.extend(sorted(row, key=lambda item: item.rect[0]))
+    return ordered
 
-    if best_rect is None:
-        # 如果没有满足面积阈值的，退化为最大轮廓
-        cnt = max(contours, key=cv2.contourArea)
-        x, y, rw, rh = cv2.boundingRect(cnt)
-        best_rect = (x, y, rw, rh)
 
-    return best_rect
+def find_chip_candidates(
+    gray: np.ndarray,
+    *,
+    min_area_ratio: float = 0.01,
+    max_area_ratio: float = 0.18,
+    max_aspect_ratio: float = 5.5,
+    min_side_ratio: float = 0.025,
+    min_score: float = 0.35,
+    nms_iou_threshold: float = 0.35,
+    padding_ratio: float = 0.06,
+    max_chips: int | None = None,
+) -> list[ChipCandidate]:
+    """
+    检测多个芯片候选框。
+    过滤逻辑强调“暗色矩形主体 + 中心比边缘更暗 + 合理面积/长宽比”，
+    用来减少木纹、阴影、画面边缘暗物体造成的误检。
+    """
+    image_h, image_w = gray.shape[:2]
+    image_area = float(image_h * image_w)
+    min_side = max(20, int(round(min(image_h, image_w) * min_side_ratio)))
+    candidates: list[ChipCandidate] = []
+
+    for source, mask in build_candidate_masks(gray):
+        for rect, contour_area in contour_rects(mask):
+            x, y, w, h = clip_rect(rect, gray.shape)
+            area_ratio = (w * h) / image_area
+            if area_ratio < min_area_ratio or area_ratio > max_area_ratio:
+                continue
+            if min(w, h) < min_side:
+                continue
+
+            aspect_ratio = max(w / h, h / w)
+            if aspect_ratio > max_aspect_ratio:
+                continue
+
+            fill_ratio = contour_area / max(float(w * h), 1.0)
+            if fill_ratio < 0.08:
+                continue
+
+            score, dark_ratio, contrast, _ = score_rect(gray, (x, y, w, h))
+            if dark_ratio < 0.22 and contrast < 25:
+                continue
+            if score < min_score:
+                continue
+            if rect_touches_border((x, y, w, h), gray.shape) and area_ratio > 0.08:
+                continue
+
+            padded = pad_rect((x, y, w, h), gray.shape, padding_ratio=padding_ratio)
+            candidates.append(ChipCandidate(rect=padded, score=score, source=source))
+
+    selected = non_max_suppression(candidates, iou_threshold=nms_iou_threshold)
+    selected = sort_rects_reading_order(selected)
+    if max_chips is not None:
+        selected = selected[:max_chips]
+    return selected
+
+
+def find_chip_rects(
+    cleaned_binary: np.ndarray, min_area_ratio: float = 0.01
+) -> list[Rect]:
+    """
+    兼容旧流程：从二值图中返回多个候选矩形。
+    新的 segment() 会直接使用 find_chip_candidates()。
+    """
+    image_h, image_w = cleaned_binary.shape[:2]
+    image_area = float(image_h * image_w)
+    rects: list[Rect] = []
+
+    for rect, _ in contour_rects(cleaned_binary):
+        x, y, w, h = clip_rect(rect, cleaned_binary.shape)
+        if (w * h) / image_area >= min_area_ratio:
+            rects.append((x, y, w, h))
+
+    return sorted(rects, key=lambda item: item[2] * item[3], reverse=True)
+
+
+def find_largest_chip_rect(
+    cleaned_binary: np.ndarray, min_area_ratio: float = 0.01
+) -> Rect:
+    """
+    兼容旧函数：返回面积最大的近似芯片区域。
+    """
+    rects = find_chip_rects(cleaned_binary, min_area_ratio=min_area_ratio)
+    if not rects:
+        raise RuntimeError("未检测到任何轮廓")
+    return rects[0]
+
+
+def output_path_for_index(output_path: str | Path, index: int, total: int) -> Path:
+    path = Path(output_path)
+    if total == 1:
+        return path
+
+    suffix = path.suffix or ".jpg"
+    return path.with_name(f"{path.stem}_{index:02d}{suffix}")
+
+
+def save_debug_images(
+    src: np.ndarray,
+    masks: list[tuple[str, np.ndarray]],
+    candidates: list[ChipCandidate],
+    output_path: str | Path,
+) -> None:
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    suffix = output.suffix or ".jpg"
+    stem = output.stem
+
+    vis = src.copy()
+    for index, candidate in enumerate(candidates, start=1):
+        x, y, w, h = candidate.rect
+        cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 0, 255), 2)
+        cv2.putText(
+            vis,
+            f"{index}:{candidate.score:.2f}",
+            (x, max(20, y - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    cv2.imwrite(str(output.with_name(f"{stem}_box{suffix}")), vis)
+    for source, mask in masks:
+        cv2.imwrite(str(output.with_name(f"{stem}_{source}{suffix}")), mask)
 
 
 def segment(
     image_path: str = "input.jpg",
     output_path: str = "chip_crop.jpg",
     debug: bool = True,
-    input_color: str = "rgb",
-):
+    input_color: str = "bgr",
+    max_chips: int | None = None,
+) -> tuple[list[np.ndarray], list[Rect]]:
     """
-    从图中分割出最大的黑色矩形（芯片）并保存
-    input_color: 'rgb' 或 'bgr'
+    从图中分割出多个黑色矩形芯片并保存。
+    input_color: 'rgb' 或 'bgr'。cv2.imread 读取的文件通常应使用 'bgr'。
+    返回: (芯片图像列表, 矩形列表)
     """
-    image_path = str(image_path)
-    output_path = str(output_path)
-
-    src = cv2.imread(image_path)
+    src = cv2.imread(str(image_path))
     if src is None:
         raise FileNotFoundError(f"无法读取图片: {image_path}")
 
-    # 注意：若你的数据是RGB排列，请使用 input_color='rgb'
     gray = to_gray(src, input_color=input_color)
-    gray = clahe_enhance(gray, clip_limit=2.0, tile_grid_size=(8, 8))
+    candidates = find_chip_candidates(gray, max_chips=max_chips)
+    if not candidates:
+        raise RuntimeError("未检测到芯片候选区域")
 
-    # 1) 二值化
-    bw = binarize(gray)
+    output = Path(output_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
 
-    # 2) 降噪
-    cleaned = denoise(bw)
+    chips: list[np.ndarray] = []
+    rects: list[Rect] = []
+    for index, candidate in enumerate(candidates, start=1):
+        x, y, w, h = candidate.rect
+        chip = src[y : y + h, x : x + w]
+        crop_path = output_path_for_index(output, index, len(candidates))
+        ok = cv2.imwrite(str(crop_path), chip)
+        if not ok:
+            raise RuntimeError(f"保存失败: {crop_path}")
 
-    # 3) 找最大矩形并裁剪
-    x, y, w, h = find_largest_chip_rect(cleaned)
-
-    # 边界保护
-    H, W = src.shape[:2]
-    x = max(0, min(x, W - 1))
-    y = max(0, min(y, H - 1))
-    w = max(1, min(w, W - x))
-    h = max(1, min(h, H - y))
-
-    chip = src[y : y + h, x : x + w]
-
-    # 保存结果
-    out_dir = Path(output_path).parent
-    out_dir.mkdir(parents=True, exist_ok=True)
-    ok = cv2.imwrite(output_path, chip)
-    if not ok:
-        raise RuntimeError(f"保存失败: {output_path}")
+        chips.append(chip)
+        rects.append(candidate.rect)
 
     if debug:
-        # 画框调试图
-        vis = src.copy()
-        cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 0, 255), 2)
+        save_debug_images(src, build_candidate_masks(gray), candidates, output)
 
-        stem = Path(output_path).stem
-        suffix = Path(output_path).suffix or ".jpg"
-        debug_bin = str(Path(output_path).with_name(f"{stem}_binary{suffix}"))
-        debug_clean = str(Path(output_path).with_name(f"{stem}_clean{suffix}"))
-        debug_box = str(Path(output_path).with_name(f"{stem}_box{suffix}"))
+    return chips, rects
 
-        cv2.imwrite(debug_bin, bw)
-        cv2.imwrite(debug_clean, cleaned)
-        cv2.imwrite(debug_box, vis)
 
-    return chip, (x, y, w, h)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="从输入图片中分割出一个或多个芯片")
+    parser.add_argument(
+        "image_path", nargs="?", default=R"images\quadra.jpg", help="输入图片路径"
+    )
+    parser.add_argument(
+        "output_path", nargs="?", default="chip_crop.jpg", help="输出裁剪图片路径"
+    )
+    parser.add_argument(
+        "--input-color",
+        choices=["bgr", "rgb"],
+        default="bgr",
+        help="输入图像通道顺序；cv2.imread 读取文件时使用 bgr",
+    )
+    parser.add_argument(
+        "--max-chips", type=int, default=None, help="最多输出的芯片数量"
+    )
+    parser.add_argument(
+        "--debug",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="是否输出候选掩码和画框调试图",
+    )
+    return parser.parse_args()
 
 
 if __name__ == "__main__":
-    # 测试图为RGB时，传入 input_color='rgb'
-    segment(R"images\good.jpg", "chip_crop.jpg", debug=True, input_color="rgb")
+    args = parse_args()
+
+    start_time = time.perf_counter()
+
+    chips, rects = segment(
+        args.image_path,
+        args.output_path,
+        debug=args.debug,
+        input_color=args.input_color,
+        max_chips=args.max_chips,
+    )
+
+    end_time = time.perf_counter()
+
+    print(f"检测到 {len(chips)} 个芯片: {rects}")
+    print(f"用时 {(end_time - start_time) * 1000} 毫秒")

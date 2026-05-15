@@ -1,5 +1,6 @@
 """OCR 服务进程管理与请求客户端。"""
 
+import argparse
 import json
 import os
 import socket
@@ -156,10 +157,16 @@ def request_ocr_bytes(
     filename: str = "image.jpg",
     timeout: float = 60.0,
     save_path: str | Path | None = RESULT_PATH,
+    enhance: bool = False,
 ) -> dict[str, Any]:
     """向 OCR 服务提交图片字节并返回 result.json 同构结果。"""
     files = {"file": (filename, image_bytes, "application/octet-stream")}
-    response = requests.post(OCR_URL, files=files, timeout=timeout)
+    response = requests.post(
+        OCR_URL,
+        files=files,
+        params={"enhance": str(enhance).lower()},
+        timeout=timeout,
+    )
     response.raise_for_status()
     result = response.json()
     save_result(result, save_path=save_path)
@@ -170,6 +177,7 @@ def recognize_array(
     image: np.ndarray,
     timeout: float = 60.0,
     save_path: str | Path | None = RESULT_PATH,
+    enhance: bool = False,
 ) -> dict[str, Any]:
     """识别 Gradio/摄像头传入的 numpy 图像。"""
     if image.ndim == 2:
@@ -188,6 +196,7 @@ def recognize_array(
         filename="frame.jpg",
         timeout=timeout,
         save_path=save_path,
+        enhance=enhance,
     )
 
 
@@ -195,6 +204,7 @@ def recognize_file(
     image_path: str | Path,
     timeout: float = 60.0,
     save_path: str | Path | None = RESULT_PATH,
+    enhance: bool = False,
 ) -> dict[str, Any]:
     """识别本地图片文件。"""
     image_file_path = Path(image_path)
@@ -204,24 +214,37 @@ def recognize_file(
             filename=image_file_path.name,
             timeout=timeout,
             save_path=save_path,
+            enhance=enhance,
         )
 
 
-def recognize(image_url: str | Path) -> dict[str, Any]:
+def recognize(image_url: str | Path, enhance: bool = False) -> dict[str, Any]:
     """兼容旧入口：识别文件并保存到 result.json。"""
-    result = recognize_file(image_url)
+    result = recognize_file(image_url, enhance=enhance)
     print("✅ 已完成，结果保存至 result.json")
     return result
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="调用本地 OCR 服务识别图片")
+    parser.add_argument(
+        "image_path", nargs="?", default="chip_crop_04.jpg", help="输入图片路径"
+    )
+    parser.add_argument(
+        "--enhance",
+        action="store_false",
+        help="启用芯片激光打标增强，多版本 OCR 后选择最佳结果",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
     process: subprocess.Popen | None = None
-    image_path = (
-        Path(sys.argv[1]) if len(sys.argv) > 1 else Path("images/chip_crop.jpg")
-    )
+    args = parse_args()
+    image_path = Path(args.image_path)
     try:
         process = ensure_ocr_service()
-        result = recognize(image_path)
+        result = recognize(image_path, enhance=args.enhance)
         print(json.dumps(result, ensure_ascii=False, indent=2))
     except (
         OSError,
