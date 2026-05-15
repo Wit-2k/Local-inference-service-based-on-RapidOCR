@@ -62,7 +62,7 @@ def serialize_ocr_result(result: Any, inference_time_ms: float) -> dict[str, Any
 def text_quality(payload: dict[str, Any]) -> float:
     quality = 0.0
     for item in payload.get("result") or []:
-        text = "".join(ch for ch in item.get("text", "") if ch.isalnum())
+        text = "".join(char for char in item.get("text", "") if char.isalnum())
         score = item.get("score") or 0.0
         quality += len(text) * float(score)
     return quality
@@ -89,6 +89,7 @@ def recognize_image(img: np.ndarray, enhance: bool = False) -> dict[str, Any]:
     for variant_name, variant_image in generate_chip_ocr_variants(img):
         payload = run_ocr(variant_image)
         quality = text_quality(payload)
+        print(quality)  # 用于调试
         if quality > best_quality:
             best_payload = payload
             best_variant = variant_name
@@ -137,7 +138,9 @@ async def health():
 async def shutdown(request: Request):
     client_host = request.client.host if request.client else ""
     if client_host not in {"127.0.0.1", "::1", "localhost"}:
-        return JSONResponse(status_code=403, content={"error": "只允许本机关闭 OCR 服务"})
+        return JSONResponse(
+            status_code=403, content={"error": "只允许本机关闭 OCR 服务"}
+        )
 
     def stop_process() -> None:
         time.sleep(0.2)

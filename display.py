@@ -16,9 +16,9 @@ from capture import (
     DEFAULT_FRAME_HEIGHT,
     DEFAULT_FRAME_WIDTH,
     bgr_to_rgb,
-    capture_frame,
     get_camera_info,
     open_camera,
+    read_frame,
 )
 from ocr_client import (
     ensure_ocr_service,
@@ -50,6 +50,8 @@ configure_local_proxy_bypass()
 
 GRADIO_SERVER_NAME = "127.0.0.1"
 GRADIO_SERVER_PORT = 7860
+RAW_CAMERA_FPS = 30.0
+RAW_CAMERA_INTERVAL_SECONDS = 1.0 / RAW_CAMERA_FPS
 APP_CSS = """
 .gradio-container {
     background:
@@ -132,6 +134,7 @@ def start_camera(
                 width=int(width),
                 height=int(height),
             )
+            camera_capture.set(cv2.CAP_PROP_FPS, RAW_CAMERA_FPS)
             info = get_camera_info(camera_capture)
         except RuntimeError as exc:
             camera_capture = None
@@ -187,20 +190,34 @@ def draw_boxes(image: np.ndarray, result: dict[str, Any]) -> np.ndarray:
     return annotated
 
 
-def capture_and_recognize(enabled: bool) -> tuple[Any, Any, str, dict[str, Any]]:
+def read_raw_camera_frame() -> Any:
+    """读取摄像头原始帧，供 30fps 预览使用。"""
+    with camera_lock:
+        if camera_capture is None or not camera_capture.isOpened():
+            return None
+
+        try:
+            frame_bgr = read_frame(camera_capture)
+        except RuntimeError:
+            return None
+
+    return bgr_to_rgb(frame_bgr)
+
+
+def capture_and_recognize(enabled: bool) -> tuple[Any, str, dict[str, Any]]:
     """用 capture.py 的 OpenCV 取帧方式抓取一帧并直接送 OCR。"""
     with camera_lock:
         if camera_capture is None or not camera_capture.isOpened():
-            return None, gr.update(), "等待启动摄像头...", {}
+            return gr.update(), "等待启动摄像头...", {}
 
         try:
-            frame_bgr, _ = capture_frame(camera_capture, save=False)
+            frame_bgr = read_frame(camera_capture)
         except RuntimeError as exc:
-            return None, gr.update(), f"❌ {exc}", {}
+            return gr.update(), f"❌ {exc}", {}
 
     frame_rgb = bgr_to_rgb(frame_bgr)
     if not enabled:
-        return frame_rgb, gr.update(), "OCR 已暂停，截图仍在更新。", {}
+        return gr.update(), "OCR 已暂停，摄像头原始流仍在更新。", {}
 
     try:
         if not is_ocr_ready():
@@ -213,10 +230,10 @@ def capture_and_recognize(enabled: bool) -> tuple[Any, Any, str, dict[str, Any]]
         TimeoutError,
         OSError,
     ) as exc:
-        return frame_rgb, gr.update(), f"❌ 识别失败：{exc}", {}
+        return gr.update(), f"❌ 识别失败：{exc}", {}
 
     annotated = draw_boxes(frame_rgb, result)
-    return frame_rgb, annotated, format_result(result), result
+    return annotated, format_result(result), result
 
 
 def set_recognition_enabled(enabled: bool) -> tuple[bool, str]:
@@ -239,7 +256,8 @@ def build_demo() -> gr.Blocks:
     with gr.Blocks(title="实时 OCR 摄像头识别") as demo:
         enabled_state = gr.State(True)
         camera_enabled_state = gr.State(False)
-        timer = gr.Timer(value=DEFAULT_CAPTURE_INTERVAL_SECONDS, active=True)
+        raw_stream_timer = gr.Timer(value=RAW_CAMERA_INTERVAL_SECONDS, active=True)
+        ocr_timer = gr.Timer(value=DEFAULT_CAPTURE_INTERVAL_SECONDS, active=True)
 
         gr.Markdown(
             "# 实时 OCR 摄像头识别\n"
@@ -268,7 +286,7 @@ def build_demo() -> gr.Blocks:
             )
 
         with gr.Row():
-            frame_preview = gr.Image(type="numpy", label="OpenCV 摄像头截图")
+            frame_preview = gr.Image(type="numpy", label="摄像头原始流")
             annotated = gr.Image(type="numpy", label="识别框预览")
 
         with gr.Row():
@@ -315,10 +333,15 @@ def build_demo() -> gr.Blocks:
         stop_service_button.click(
             stop_background_service, outputs=[status, enabled_state]
         )
-        timer.tick(
+        raw_stream_timer.tick(
+            read_raw_camera_frame,
+            outputs=[frame_preview],
+            concurrency_limit=1,
+        )
+        ocr_timer.tick(
             capture_and_recognize,
             inputs=[enabled_state],
-            outputs=[frame_preview, annotated, result_text, result_json],
+            outputs=[annotated, result_text, result_json],
             concurrency_limit=1,
         )
 

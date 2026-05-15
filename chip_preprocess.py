@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
+from pathlib import Path
+
 import cv2
 import numpy as np
 
@@ -76,3 +79,65 @@ def generate_chip_ocr_variants(image: np.ndarray) -> list[tuple[str, np.ndarray]
         ("laser_dark", enhance_laser_marking(upscaled, invert=True)),
         ("blackhat", blackhat_enhance(upscaled)),
     ]
+
+
+def output_dir_for_image(image_path: str | Path) -> Path:
+    path = Path(image_path)
+    return path.with_name(f"{path.stem}_preprocess_variants")
+
+
+def save_chip_ocr_variants(
+    image_path: str | Path,
+    output_dir: str | Path | None = None,
+    extension: str = ".jpg",
+) -> list[Path]:
+    src = cv2.imread(str(image_path))
+    if src is None:
+        raise FileNotFoundError(f"无法读取图片: {image_path}")
+
+    output = (
+        Path(output_dir) if output_dir is not None else output_dir_for_image(image_path)
+    )
+    output.mkdir(parents=True, exist_ok=True)
+
+    suffix = extension if extension.startswith(".") else f".{extension}"
+    saved_paths: list[Path] = []
+    for index, (name, variant) in enumerate(generate_chip_ocr_variants(src), start=1):
+        path = output / f"{index:02d}_{name}{suffix}"
+        ok = cv2.imwrite(str(path), variant)
+        if not ok:
+            raise RuntimeError(f"保存失败: {path}")
+        saved_paths.append(path)
+
+    return saved_paths
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="输出芯片 OCR 预处理的七种调试变体")
+    parser.add_argument(
+        "image_path", nargs="?", default="chip_crop_03.jpg", help="输入芯片图片路径"
+    )
+    parser.add_argument(
+        "output_dir",
+        nargs="?",
+        default="preprocess_variants/",
+        help="输出目录；默认使用 <输入文件名>_preprocess_variants",
+    )
+    parser.add_argument(
+        "--ext",
+        default=".jpg",
+        help="输出图片扩展名，例如 .jpg 或 .png",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    saved_paths = save_chip_ocr_variants(args.image_path, args.output_dir, args.ext)
+    print(f"已输出 {len(saved_paths)} 个预处理变体:")
+    for path in saved_paths:
+        print(path)
+
+
+if __name__ == "__main__":
+    main()

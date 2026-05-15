@@ -13,6 +13,8 @@ DEFAULT_FRAME_WIDTH = 2560
 DEFAULT_FRAME_HEIGHT = 1440
 DEFAULT_CAPTURE_INTERVAL_SECONDS = 1.0
 DEFAULT_FRAME_RETENTION_SECONDS = 10 * 60
+CAMERA_OPEN_READ_ATTEMPTS = 3
+CAMERA_OPEN_RETRY_DELAY_SECONDS = 0.1
 
 
 @dataclass(frozen=True)
@@ -35,11 +37,39 @@ def open_camera(
 ) -> cv2.VideoCapture:
     cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
-        raise RuntimeError("无法打开摄像头")
+        cap.release()
+        raise RuntimeError(
+            f"无法打开摄像头 {camera_index}。请确认设备已连接，并关闭可能占用摄像头的"
+            "程序后重试，例如系统相机、会议软件或浏览器页面。"
+        )
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    try:
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        ensure_camera_readable(cap, camera_index)
+    except RuntimeError:
+        cap.release()
+        raise
     return cap
+
+
+def ensure_camera_readable(
+    cap: cv2.VideoCapture,
+    camera_index: int,
+    attempts: int = CAMERA_OPEN_READ_ATTEMPTS,
+    retry_delay_seconds: float = CAMERA_OPEN_RETRY_DELAY_SECONDS,
+) -> None:
+    for attempt in range(attempts):
+        ok, frame = cap.read()
+        if ok and frame is not None and frame.size > 0:
+            return
+        if attempt < attempts - 1:
+            time.sleep(retry_delay_seconds)
+
+    raise RuntimeError(
+        f"摄像头 {camera_index} 已打开但无法读取画面，可能正被其他程序占用，"
+        "或摄像头驱动尚未准备好。请关闭占用摄像头的程序后重试。"
+    )
 
 
 def get_camera_info(cap: cv2.VideoCapture) -> CameraInfo:
@@ -112,7 +142,6 @@ def capture_frame(
 def main() -> None:
     os.makedirs(FRAME_DIR, exist_ok=True)
 
-    # 目前一次只能识别一个芯片
     cap = open_camera()
 
     info = get_camera_info(cap)

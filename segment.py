@@ -13,6 +13,12 @@ import cv2
 import numpy as np
 
 Rect = tuple[int, int, int, int]
+CandidateMask = tuple[str, np.ndarray]
+
+EDGE_CLOSE_KERNELS: tuple[tuple[int, int], ...] = ((7, 7), (15, 15), (31, 15))
+MIN_DARK_RATIO = 0.22
+MIN_CENTER_BORDER_CONTRAST = 25.0
+MAX_BORDER_TOUCHING_AREA_RATIO = 0.08
 
 
 @dataclass(frozen=True)
@@ -53,7 +59,7 @@ def to_gray(image: np.ndarray, input_color: str = "rgb") -> np.ndarray:
 def clahe_enhance(
     gray: np.ndarray,
     clip_limit: float = 2.0,
-    tile_grid_size: tuple = (8, 8),
+    tile_grid_size: tuple[int, int] = (8, 8),
 ) -> np.ndarray:
     """
     CLAHE 对比度受限自适应直方图均衡化（用于灰度图）
@@ -112,7 +118,7 @@ def auto_canny(gray: np.ndarray, sigma: float = 0.33) -> np.ndarray:
     return cv2.Canny(gray, lower, upper)
 
 
-def build_candidate_masks(gray: np.ndarray) -> list[tuple[str, np.ndarray]]:
+def build_candidate_masks(gray: np.ndarray) -> list[CandidateMask]:
     """
     构造多路候选掩码：
     - dark: 暗区域阈值，适合黑色芯片主体清晰的场景
@@ -122,11 +128,11 @@ def build_candidate_masks(gray: np.ndarray) -> list[tuple[str, np.ndarray]]:
     enhanced = clahe_enhance(blur, clip_limit=2.0, tile_grid_size=(8, 8))
 
     dark = denoise(binarize(enhanced))
-    masks: list[tuple[str, np.ndarray]] = [("dark", dark)]
+    masks: list[CandidateMask] = [("dark", dark)]
 
     edges = auto_canny(blur)
     open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    for kernel_size in [(7, 7), (15, 15), (31, 15)]:
+    for kernel_size in EDGE_CLOSE_KERNELS:
         close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, kernel_size)
         closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, close_kernel, iterations=2)
         closed = cv2.dilate(closed, close_kernel, iterations=1)
@@ -159,19 +165,30 @@ def rect_area(rect: Rect) -> int:
     return rect[2] * rect[3]
 
 
-def rect_iou(rect_a: Rect, rect_b: Rect) -> float:
+def rect_intersection_area(rect_a: Rect, rect_b: Rect) -> int:
     ax, ay, aw, ah = rect_a
     bx, by, bw, bh = rect_b
     left = max(ax, bx)
     top = max(ay, by)
     right = min(ax + aw, bx + bw)
     bottom = min(ay + ah, by + bh)
-    if right <= left or bottom <= top:
+    return max(0, right - left) * max(0, bottom - top)
+
+
+def rect_iou(rect_a: Rect, rect_b: Rect) -> float:
+    intersection = rect_intersection_area(rect_a, rect_b)
+    if intersection == 0:
         return 0.0
 
-    intersection = (right - left) * (bottom - top)
     union = rect_area(rect_a) + rect_area(rect_b) - intersection
     return intersection / union if union > 0 else 0.0
+
+
+def rect_containment_ratio(inner: Rect, outer: Rect) -> float:
+    inner_area = rect_area(inner)
+    if inner_area == 0:
+        return 0.0
+    return rect_intersection_area(inner, outer) / inner_area
 
 
 def center_border_contrast(roi: np.ndarray) -> float:
@@ -232,6 +249,20 @@ def contour_rects(mask: np.ndarray) -> Iterable[tuple[Rect, float]]:
         yield cv2.boundingRect(contour), contour_area
 
 
+def is_duplicate_candidate(
+    candidate: ChipCandidate,
+    selected: ChipCandidate,
+    *,
+    iou_threshold: float,
+    containment_threshold: float,
+) -> bool:
+    if rect_iou(candidate.rect, selected.rect) >= iou_threshold:
+        return True
+    return (
+        rect_containment_ratio(candidate.rect, selected.rect) >= containment_threshold
+    )
+
+
 def non_max_suppression(
     candidates: list[ChipCandidate],
     iou_threshold: float = 0.35,
@@ -239,30 +270,54 @@ def non_max_suppression(
 ) -> list[ChipCandidate]:
     selected: list[ChipCandidate] = []
     for candidate in sorted(candidates, key=lambda item: item.score, reverse=True):
-        candidate_area = rect_area(candidate.rect)
-        should_keep = True
-        for item in selected:
-            if rect_iou(candidate.rect, item.rect) >= iou_threshold:
-                should_keep = False
-                break
-
-            x, y, w, h = candidate.rect
-            sx, sy, sw, sh = item.rect
-            left = max(x, sx)
-            top = max(y, sy)
-            right = min(x + w, sx + sw)
-            bottom = min(y + h, sy + sh)
-            intersection = max(0, right - left) * max(0, bottom - top)
-            if (
-                candidate_area > 0
-                and intersection / candidate_area >= containment_threshold
-            ):
-                should_keep = False
-                break
-
-        if should_keep:
+        if not any(
+            is_duplicate_candidate(
+                candidate,
+                item,
+                iou_threshold=iou_threshold,
+                containment_threshold=containment_threshold,
+            )
+            for item in selected
+        ):
             selected.append(candidate)
     return selected
+
+
+def has_plausible_geometry(
+    rect: Rect,
+    contour_area: float,
+    *,
+    image_area: float,
+    min_area_ratio: float,
+    max_area_ratio: float,
+    max_aspect_ratio: float,
+    min_side: int,
+) -> bool:
+    _, _, w, h = rect
+    area = rect_area(rect)
+    area_ratio = area / image_area
+    if area_ratio < min_area_ratio or area_ratio > max_area_ratio:
+        return False
+    if min(w, h) < min_side:
+        return False
+
+    aspect_ratio = max(w / h, h / w)
+    if aspect_ratio > max_aspect_ratio:
+        return False
+
+    fill_ratio = contour_area / max(float(area), 1.0)
+    return fill_ratio >= 0.08
+
+
+def score_plausible_chip(
+    gray: np.ndarray, rect: Rect, min_score: float
+) -> float | None:
+    score, dark_ratio, contrast, _ = score_rect(gray, rect)
+    if dark_ratio < MIN_DARK_RATIO and contrast < MIN_CENTER_BORDER_CONTRAST:
+        return None
+    if score < min_score:
+        return None
+    return score
 
 
 def sort_rects_reading_order(candidates: list[ChipCandidate]) -> list[ChipCandidate]:
@@ -313,30 +368,30 @@ def find_chip_candidates(
 
     for source, mask in build_candidate_masks(gray):
         for rect, contour_area in contour_rects(mask):
-            x, y, w, h = clip_rect(rect, gray.shape)
-            area_ratio = (w * h) / image_area
-            if area_ratio < min_area_ratio or area_ratio > max_area_ratio:
-                continue
-            if min(w, h) < min_side:
-                continue
-
-            aspect_ratio = max(w / h, h / w)
-            if aspect_ratio > max_aspect_ratio:
-                continue
-
-            fill_ratio = contour_area / max(float(w * h), 1.0)
-            if fill_ratio < 0.08:
+            clipped_rect = clip_rect(rect, gray.shape)
+            if not has_plausible_geometry(
+                clipped_rect,
+                contour_area,
+                image_area=image_area,
+                min_area_ratio=min_area_ratio,
+                max_area_ratio=max_area_ratio,
+                max_aspect_ratio=max_aspect_ratio,
+                min_side=min_side,
+            ):
                 continue
 
-            score, dark_ratio, contrast, _ = score_rect(gray, (x, y, w, h))
-            if dark_ratio < 0.22 and contrast < 25:
-                continue
-            if score < min_score:
-                continue
-            if rect_touches_border((x, y, w, h), gray.shape) and area_ratio > 0.08:
+            score = score_plausible_chip(gray, clipped_rect, min_score)
+            if score is None:
                 continue
 
-            padded = pad_rect((x, y, w, h), gray.shape, padding_ratio=padding_ratio)
+            area_ratio = rect_area(clipped_rect) / image_area
+            if (
+                rect_touches_border(clipped_rect, gray.shape)
+                and area_ratio > MAX_BORDER_TOUCHING_AREA_RATIO
+            ):
+                continue
+
+            padded = pad_rect(clipped_rect, gray.shape, padding_ratio=padding_ratio)
             candidates.append(ChipCandidate(rect=padded, score=score, source=source))
 
     selected = non_max_suppression(candidates, iou_threshold=nms_iou_threshold)
@@ -344,37 +399,6 @@ def find_chip_candidates(
     if max_chips is not None:
         selected = selected[:max_chips]
     return selected
-
-
-def find_chip_rects(
-    cleaned_binary: np.ndarray, min_area_ratio: float = 0.01
-) -> list[Rect]:
-    """
-    兼容旧流程：从二值图中返回多个候选矩形。
-    新的 segment() 会直接使用 find_chip_candidates()。
-    """
-    image_h, image_w = cleaned_binary.shape[:2]
-    image_area = float(image_h * image_w)
-    rects: list[Rect] = []
-
-    for rect, _ in contour_rects(cleaned_binary):
-        x, y, w, h = clip_rect(rect, cleaned_binary.shape)
-        if (w * h) / image_area >= min_area_ratio:
-            rects.append((x, y, w, h))
-
-    return sorted(rects, key=lambda item: item[2] * item[3], reverse=True)
-
-
-def find_largest_chip_rect(
-    cleaned_binary: np.ndarray, min_area_ratio: float = 0.01
-) -> Rect:
-    """
-    兼容旧函数：返回面积最大的近似芯片区域。
-    """
-    rects = find_chip_rects(cleaned_binary, min_area_ratio=min_area_ratio)
-    if not rects:
-        raise RuntimeError("未检测到任何轮廓")
-    return rects[0]
 
 
 def output_path_for_index(output_path: str | Path, index: int, total: int) -> Path:
@@ -388,7 +412,7 @@ def output_path_for_index(output_path: str | Path, index: int, total: int) -> Pa
 
 def save_debug_images(
     src: np.ndarray,
-    masks: list[tuple[str, np.ndarray]],
+    masks: list[CandidateMask],
     candidates: list[ChipCandidate],
     output_path: str | Path,
 ) -> None:
@@ -463,7 +487,7 @@ def segment(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="从输入图片中分割出一个或多个芯片")
     parser.add_argument(
-        "image_path", nargs="?", default=R"images\quadra.jpg", help="输入图片路径"
+        "image_path", nargs="?", default=R"images\big.jpg", help="输入图片路径"
     )
     parser.add_argument(
         "output_path", nargs="?", default="chip_crop.jpg", help="输出裁剪图片路径"
