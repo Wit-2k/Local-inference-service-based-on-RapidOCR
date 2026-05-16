@@ -27,7 +27,7 @@ from ocr_client import (
     request_server_shutdown,
     shutdown_server,
 )
-from segment import Rect, segment_array
+from segment import SegmentedChip, segment_array_with_metadata
 
 LOCAL_PROXY_BYPASS = "localhost,127.0.0.1,::1"
 
@@ -219,6 +219,63 @@ APP_CSS = """
     font-family: Consolas, 'Cascadia Mono', monospace;
     margin-top: 6px;
 }
+#chip-ocr-app .history-panel {
+    background: rgba(255, 255, 255, 0.96);
+    border-radius: 8px;
+    color: #121918;
+    margin-top: 18px;
+    padding: 18px;
+}
+#chip-ocr-app .history-window {
+    display: grid;
+    gap: 10px;
+    max-height: 340px;
+    overflow-y: auto;
+    padding-right: 4px;
+}
+#chip-ocr-app .history-empty {
+    border: 1px dashed #cbd5d1;
+    border-radius: 8px;
+    color: #66736f;
+    padding: 22px;
+    text-align: center;
+}
+#chip-ocr-app .history-record {
+    align-items: center;
+    border: 1px solid #d8e0dd;
+    border-radius: 8px;
+    display: grid;
+    gap: 14px;
+    grid-template-columns: 180px minmax(0, 1fr) auto;
+    padding: 10px;
+}
+#chip-ocr-app .history-thumb {
+    aspect-ratio: 16 / 9;
+    background: #eef1ef;
+    border-radius: 6px;
+    object-fit: cover;
+    width: 100%;
+}
+#chip-ocr-app .history-models {
+    align-items: center;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+#chip-ocr-app .model-pill {
+    background: #fff1e6;
+    border: 1px solid #ffc58d;
+    border-radius: 999px;
+    color: #9a3412;
+    font-weight: 800;
+    padding: 6px 10px;
+}
+#chip-ocr-app .history-time {
+    color: #54615d;
+    font-family: Consolas, 'Cascadia Mono', monospace;
+    font-size: 13px;
+    white-space: nowrap;
+}
 @media (max-width: 900px) {
     #chip-ocr-app .app-header,
     #chip-ocr-app .workspace {
@@ -234,6 +291,13 @@ APP_CSS = """
     }
     #chip-ocr-app .controls {
         grid-template-columns: 1fr 1fr;
+    }
+    #chip-ocr-app .history-record {
+        align-items: start;
+        grid-template-columns: 1fr;
+    }
+    #chip-ocr-app .history-time {
+        white-space: normal;
     }
 }
 """
@@ -273,6 +337,15 @@ WEBRTC_HTML = """
         </div>
         <div class="chip-grid" data-role="results"></div>
     </section>
+    <section class="history-panel">
+        <div class="results-header">
+            <h2>成功识别历史</h2>
+            <span class="summary" data-role="history-summary">0 条记录</span>
+        </div>
+        <div class="history-window" data-role="history">
+            <div class="history-empty" data-role="history-empty">暂无匹配记录</div>
+        </div>
+    </section>
     <canvas data-role="canvas" hidden></canvas>
 </div>
 """
@@ -284,6 +357,9 @@ const canvas = app.querySelector('[data-role="canvas"]');
 const statusEl = app.querySelector('[data-role="status"]');
 const summaryEl = app.querySelector('[data-role="summary"]');
 const resultsEl = app.querySelector('[data-role="results"]');
+const historyEl = app.querySelector('[data-role="history"]');
+const historySummaryEl = app.querySelector('[data-role="history-summary"]');
+const historyEmpty = app.querySelector('[data-role="history-empty"]');
 const annotatedEl = app.querySelector('[data-role="annotated"]');
 const cameraEmpty = app.querySelector('[data-role="camera-empty"]');
 const previewEmpty = app.querySelector('[data-role="preview-empty"]');
@@ -294,10 +370,15 @@ const stopButton = app.querySelector('[data-role="stop-button"]');
 const constraints = {json.dumps(WEBCAM_CONSTRAINTS)};
 const intervalMs = {int(DEFAULT_CAPTURE_INTERVAL_SECONDS * 1000)};
 const jpegQuality = {JPEG_QUALITY / 100:.2f};
+const maxHistoryRecords = 20;
+const historyDedupeMs = 3000;
 let stream = null;
 let recognizeTimer = null;
 let recognizing = false;
 let requestInFlight = false;
+let historyRecordCount = 0;
+let lastHistorySignature = '';
+let lastHistoryAt = 0;
 
 function setStatus(message) {{
     statusEl.textContent = message;
@@ -353,6 +434,75 @@ function addText(parent, tag, text, className = '') {{
     return node;
 }}
 
+function matchedModels(payload) {{
+    const models = [];
+    for (const chip of payload.chips || []) {{
+        const partNumber = chip.match && chip.match.part_number;
+        if (partNumber && !models.includes(partNumber)) {{
+            models.push(partNumber);
+        }}
+    }}
+    return models;
+}}
+
+function formatRecordTime(date) {{
+    return date.toLocaleString('zh-CN', {{
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+    }});
+}}
+
+function updateHistorySummary() {{
+    const count = historyEl.querySelectorAll('.history-record').length;
+    historySummaryEl.textContent = `${{count}} 条记录`;
+    if (historyEmpty) {{
+        historyEmpty.style.display = count ? 'none' : 'block';
+    }}
+}}
+
+function appendMatchedHistory(payload) {{
+    const models = matchedModels(payload);
+    if (!models.length || !payload.annotated_image) return;
+
+    const now = Date.now();
+    const signature = models.join('|');
+    if (signature === lastHistorySignature && now - lastHistoryAt < historyDedupeMs) {{
+        return;
+    }}
+    lastHistorySignature = signature;
+    lastHistoryAt = now;
+
+    const record = document.createElement('article');
+    record.className = 'history-record';
+    record.dataset.historyId = String(++historyRecordCount);
+
+    const image = document.createElement('img');
+    image.className = 'history-thumb';
+    image.alt = '识别框画面';
+    image.src = payload.annotated_image;
+    record.appendChild(image);
+
+    const modelWrap = document.createElement('div');
+    modelWrap.className = 'history-models';
+    for (const model of models) {{
+        addText(modelWrap, 'span', model, 'model-pill');
+    }}
+    record.appendChild(modelWrap);
+
+    addText(record, 'time', formatRecordTime(new Date(now)), 'history-time');
+    historyEl.prepend(record);
+
+    const records = historyEl.querySelectorAll('.history-record');
+    for (let index = maxHistoryRecords; index < records.length; index += 1) {{
+        records[index].remove();
+    }}
+    updateHistorySummary();
+}}
+
 function renderResults(payload) {{
     payload = normalizeServerPayload(payload, {{
         status: '未收到识别结果',
@@ -394,6 +544,7 @@ function renderResults(payload) {{
         }}
         resultsEl.appendChild(card);
     }}
+    appendMatchedHistory(payload);
 }}
 
 async function startCamera() {{
@@ -619,13 +770,21 @@ def rgb_to_data_url(image: np.ndarray) -> str:
     return f"data:image/jpeg;base64,{payload}"
 
 
-def draw_chip_boxes(image: np.ndarray, rects: list[Rect]) -> np.ndarray:
+def draw_chip_boxes(image: np.ndarray, chips: list[SegmentedChip]) -> np.ndarray:
     annotated = image.copy()
     line_width = max(2, min(image.shape[:2]) // 280)
     font_scale = max(0.6, min(image.shape[:2]) / 900)
-    for index, rect in enumerate(rects, start=1):
-        x, y, w, h = rect
-        cv2.rectangle(annotated, (x, y), (x + w, y + h), (255, 0, 0), line_width)
+    for index, chip in enumerate(chips, start=1):
+        points = np.array(chip.box_points, dtype=np.int32)
+        cv2.polylines(
+            annotated,
+            [points.reshape((-1, 1, 2))],
+            isClosed=True,
+            color=(255, 0, 0),
+            thickness=line_width,
+        )
+        x = int(points[:, 0].min())
+        y = int(points[:, 1].min())
         label = f"chip {index}"
         baseline = 0
         (text_w, text_h), baseline = cv2.getTextSize(
@@ -654,7 +813,7 @@ def draw_chip_boxes(image: np.ndarray, rects: list[Rect]) -> np.ndarray:
 
 def chip_result_payload(
     index: int,
-    rect: Rect,
+    chip: SegmentedChip,
     ocr_payload: dict[str, Any] | None,
     error: str | None = None,
 ) -> dict[str, Any]:
@@ -664,10 +823,14 @@ def chip_result_payload(
             texts.append({"text": item.get("text", ""), "score": item.get("score")})
 
     match = match_ocr_payload(ocr_payload or {"result": []})
-    x, y, w, h = rect
+    x, y, w, h = chip.rect
     return {
         "index": index,
         "rect": {"x": x, "y": y, "w": w, "h": h},
+        "box_points": [{"x": px, "y": py} for px, py in chip.box_points],
+        "angle": chip.angle,
+        "segment_score": chip.score,
+        "segment_source": chip.source,
         "texts": texts,
         "match": match,
         "inference_time_ms": (ocr_payload or {}).get("inference_time_ms"),
@@ -675,9 +838,9 @@ def chip_result_payload(
     }
 
 
-def recognize_chip(index: int, chip: np.ndarray, rect: Rect) -> dict[str, Any]:
+def recognize_chip(index: int, chip: SegmentedChip) -> dict[str, Any]:
     try:
-        payload = recognize_array(chip, save_path=None)
+        payload = recognize_array(chip.image, save_path=None)
     except (
         RuntimeError,
         ValueError,
@@ -685,12 +848,12 @@ def recognize_chip(index: int, chip: np.ndarray, rect: Rect) -> dict[str, Any]:
         TimeoutError,
         OSError,
     ) as exc:
-        return chip_result_payload(index, rect, None, error=f"识别失败：{exc}")
-    return chip_result_payload(index, rect, payload)
+        return chip_result_payload(index, chip, None, error=f"识别失败：{exc}")
+    return chip_result_payload(index, chip, payload)
 
 
 def recognize_chips_parallel(
-    chips: list[tuple[np.ndarray, Rect]],
+    chips: list[SegmentedChip],
 ) -> list[dict[str, Any]]:
     if not chips:
         return []
@@ -699,8 +862,8 @@ def recognize_chips_parallel(
     results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(recognize_chip, index, chip, rect): index
-            for index, (chip, rect) in enumerate(chips, start=1)
+            executor.submit(recognize_chip, index, chip): index
+            for index, chip in enumerate(chips, start=1)
         }
         for future in as_completed(futures):
             results.append(future.result())
@@ -738,7 +901,7 @@ def recognize_multi_chip_frame(data_url: Any, enabled: bool = True) -> dict[str,
         }
 
     try:
-        chips = segment_array(frame_rgb, input_color="rgb")
+        chips = segment_array_with_metadata(frame_rgb, input_color="rgb")
     except RuntimeError as exc:
         return {
             "status": f"分割失败：{exc}",
@@ -747,8 +910,7 @@ def recognize_multi_chip_frame(data_url: Any, enabled: bool = True) -> dict[str,
             "annotated_image": None,
         }
 
-    rects = [rect for _, rect in chips]
-    annotated = draw_chip_boxes(frame_rgb, rects) if rects else frame_rgb
+    annotated = draw_chip_boxes(frame_rgb, chips) if chips else frame_rgb
     annotated_image = rgb_to_data_url(annotated)
 
     if not chips:
@@ -766,8 +928,8 @@ def recognize_multi_chip_frame(data_url: Any, enabled: bool = True) -> dict[str,
                 "status": service_status,
                 "summary": f"检测到 {len(chips)} 个芯片，OCR 服务不可用",
                 "chips": [
-                    chip_result_payload(index, rect, None, error="OCR 服务不可用")
-                    for index, (_, rect) in enumerate(chips, start=1)
+                    chip_result_payload(index, chip, None, error="OCR 服务不可用")
+                    for index, chip in enumerate(chips, start=1)
                 ],
                 "annotated_image": annotated_image,
             }

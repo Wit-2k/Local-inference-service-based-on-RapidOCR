@@ -13,8 +13,11 @@ import cv2
 import numpy as np
 
 Rect = tuple[int, int, int, int]
+Point = tuple[int, int]
+BoxPoints = tuple[Point, Point, Point, Point]
 CandidateMask = tuple[str, np.ndarray]
 
+DARK_CLOSE_KERNELS: tuple[tuple[int, int], ...] = ((9, 9), (21, 11), (41, 17))
 EDGE_CLOSE_KERNELS: tuple[tuple[int, int], ...] = ((7, 7), (15, 15), (31, 15))
 MIN_DARK_RATIO = 0.22
 MIN_CENTER_BORDER_CONTRAST = 25.0
@@ -24,6 +27,19 @@ MAX_BORDER_TOUCHING_AREA_RATIO = 0.08
 @dataclass(frozen=True)
 class ChipCandidate:
     rect: Rect
+    box_points: BoxPoints
+    angle: float
+    rotated_area: float
+    score: float
+    source: str
+
+
+@dataclass(frozen=True)
+class SegmentedChip:
+    image: np.ndarray
+    rect: Rect
+    box_points: BoxPoints
+    angle: float
     score: float
     source: str
 
@@ -127,11 +143,22 @@ def build_candidate_masks(gray: np.ndarray) -> list[CandidateMask]:
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     enhanced = clahe_enhance(blur, clip_limit=2.0, tile_grid_size=(8, 8))
 
-    dark = denoise(binarize(enhanced))
+    dark_base = binarize(enhanced)
+    dark = denoise(dark_base)
     masks: list[CandidateMask] = [("dark", dark)]
 
-    edges = auto_canny(blur)
     open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    for kernel_size in DARK_CLOSE_KERNELS:
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, kernel_size)
+        closed_dark = cv2.morphologyEx(
+            dark_base, cv2.MORPH_CLOSE, close_kernel, iterations=2
+        )
+        closed_dark = cv2.morphologyEx(
+            closed_dark, cv2.MORPH_OPEN, open_kernel, iterations=1
+        )
+        masks.append((f"dark_close_{kernel_size[0]}x{kernel_size[1]}", closed_dark))
+
+    edges = auto_canny(blur)
     for kernel_size in EDGE_CLOSE_KERNELS:
         close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, kernel_size)
         closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, close_kernel, iterations=2)
@@ -159,6 +186,85 @@ def pad_rect(
     pad_x = int(round(w * padding_ratio))
     pad_y = int(round(h * padding_ratio))
     return clip_rect((x - pad_x, y - pad_y, w + 2 * pad_x, h + 2 * pad_y), image_shape)
+
+
+def clip_point(point: tuple[float, float], image_shape: tuple[int, int]) -> Point:
+    image_h, image_w = image_shape[:2]
+    x = max(0, min(int(round(point[0])), image_w - 1))
+    y = max(0, min(int(round(point[1])), image_h - 1))
+    return x, y
+
+
+def points_to_box(points: np.ndarray, image_shape: tuple[int, int]) -> BoxPoints:
+    clipped = [clip_point(point, image_shape) for point in points[:4]]
+    return clipped[0], clipped[1], clipped[2], clipped[3]
+
+
+def rect_from_box_points(box_points: BoxPoints, image_shape: tuple[int, int]) -> Rect:
+    points = np.array(box_points, dtype=np.int32)
+    x, y, w, h = cv2.boundingRect(points)
+    return clip_rect((x, y, w, h), image_shape)
+
+
+def expand_rotated_rect(
+    rotated_rect: tuple[tuple[float, float], tuple[float, float], float],
+    image_shape: tuple[int, int],
+    padding_ratio: float,
+) -> tuple[BoxPoints, Rect, tuple[float, float], float]:
+    center, size, angle = rotated_rect
+    width = max(float(size[0]), 1.0)
+    height = max(float(size[1]), 1.0)
+    padded_size = (
+        width * (1.0 + 2.0 * padding_ratio),
+        height * (1.0 + 2.0 * padding_ratio),
+    )
+    points = cv2.boxPoints((center, padded_size, angle))
+    box_points = points_to_box(points, image_shape)
+    rect = rect_from_box_points(box_points, image_shape)
+    long_side_angle = float(angle if width >= height else angle + 90.0)
+    return box_points, rect, (width, height), long_side_angle
+
+
+def order_box_points(box_points: BoxPoints) -> np.ndarray:
+    points = np.array(box_points, dtype=np.float32)
+    ordered = np.zeros((4, 2), dtype=np.float32)
+    sums = points.sum(axis=1)
+    diffs = np.diff(points, axis=1).ravel()
+
+    ordered[0] = points[np.argmin(sums)]
+    ordered[2] = points[np.argmax(sums)]
+    ordered[1] = points[np.argmin(diffs)]
+    ordered[3] = points[np.argmax(diffs)]
+    return ordered
+
+
+def crop_rotated_box(image: np.ndarray, box_points: BoxPoints) -> np.ndarray:
+    ordered = order_box_points(box_points)
+    top_width = np.linalg.norm(ordered[1] - ordered[0])
+    bottom_width = np.linalg.norm(ordered[2] - ordered[3])
+    right_height = np.linalg.norm(ordered[2] - ordered[1])
+    left_height = np.linalg.norm(ordered[3] - ordered[0])
+    width = max(int(round(max(top_width, bottom_width))), 1)
+    height = max(int(round(max(right_height, left_height))), 1)
+
+    if height > width:
+        ordered = np.array(
+            [ordered[3], ordered[0], ordered[1], ordered[2]], dtype=np.float32
+        )
+        width, height = height, width
+
+    destination = np.array(
+        [[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]],
+        dtype=np.float32,
+    )
+    transform = cv2.getPerspectiveTransform(ordered, destination)
+    return cv2.warpPerspective(
+        image,
+        transform,
+        (width, height),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
 
 
 def rect_area(rect: Rect) -> int:
@@ -240,13 +346,13 @@ def rect_touches_border(
     )
 
 
-def contour_rects(mask: np.ndarray) -> Iterable[tuple[Rect, float]]:
+def contour_shapes(mask: np.ndarray) -> Iterable[tuple[np.ndarray, float]]:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for contour in contours:
         contour_area = cv2.contourArea(contour)
         if contour_area <= 0:
             continue
-        yield cv2.boundingRect(contour), contour_area
+        yield contour, contour_area
 
 
 def is_duplicate_candidate(
@@ -258,9 +364,25 @@ def is_duplicate_candidate(
 ) -> bool:
     if rect_iou(candidate.rect, selected.rect) >= iou_threshold:
         return True
-    return (
-        rect_containment_ratio(candidate.rect, selected.rect) >= containment_threshold
+    return max(
+        rect_containment_ratio(candidate.rect, selected.rect),
+        rect_containment_ratio(selected.rect, candidate.rect),
+    ) >= containment_threshold
+
+
+def should_replace_duplicate(
+    candidate: ChipCandidate,
+    selected: ChipCandidate,
+    *,
+    containment_threshold: float,
+) -> bool:
+    selected_inside_candidate = (
+        rect_containment_ratio(selected.rect, candidate.rect) >= containment_threshold
     )
+    much_larger = candidate.rotated_area >= selected.rotated_area * 1.2
+    if selected_inside_candidate and much_larger:
+        return candidate.score >= selected.score * 0.7
+    return candidate.score > selected.score
 
 
 def non_max_suppression(
@@ -269,22 +391,38 @@ def non_max_suppression(
     containment_threshold: float = 0.75,
 ) -> list[ChipCandidate]:
     selected: list[ChipCandidate] = []
-    for candidate in sorted(candidates, key=lambda item: item.score, reverse=True):
-        if not any(
-            is_duplicate_candidate(
-                candidate,
-                item,
-                iou_threshold=iou_threshold,
-                containment_threshold=containment_threshold,
-            )
-            for item in selected
-        ):
+    for candidate in sorted(
+        candidates, key=lambda item: (item.score, item.rotated_area), reverse=True
+    ):
+        duplicate_index = next(
+            (
+                index
+                for index, item in enumerate(selected)
+                if is_duplicate_candidate(
+                    candidate,
+                    item,
+                    iou_threshold=iou_threshold,
+                    containment_threshold=containment_threshold,
+                )
+            ),
+            None,
+        )
+        if duplicate_index is None:
             selected.append(candidate)
+            continue
+
+        selected_candidate = selected[duplicate_index]
+        if should_replace_duplicate(
+            candidate,
+            selected_candidate,
+            containment_threshold=containment_threshold,
+        ):
+            selected[duplicate_index] = candidate
     return selected
 
 
 def has_plausible_geometry(
-    rect: Rect,
+    rotated_size: tuple[float, float],
     contour_area: float,
     *,
     image_area: float,
@@ -293,8 +431,9 @@ def has_plausible_geometry(
     max_aspect_ratio: float,
     min_side: int,
 ) -> bool:
-    _, _, w, h = rect
-    area = rect_area(rect)
+    w = max(float(rotated_size[0]), 1.0)
+    h = max(float(rotated_size[1]), 1.0)
+    area = w * h
     area_ratio = area / image_area
     if area_ratio < min_area_ratio or area_ratio > max_area_ratio:
         return False
@@ -348,12 +487,12 @@ def find_chip_candidates(
     gray: np.ndarray,
     *,
     min_area_ratio: float = 0.01,
-    max_area_ratio: float = 0.18,
-    max_aspect_ratio: float = 5.5,
+    max_area_ratio: float = 0.35,
+    max_aspect_ratio: float = 7.0,
     min_side_ratio: float = 0.025,
     min_score: float = 0.35,
     nms_iou_threshold: float = 0.35,
-    padding_ratio: float = 0.06,
+    padding_ratio: float = 0.08,
     max_chips: int | None = None,
 ) -> list[ChipCandidate]:
     """
@@ -367,10 +506,13 @@ def find_chip_candidates(
     candidates: list[ChipCandidate] = []
 
     for source, mask in build_candidate_masks(gray):
-        for rect, contour_area in contour_rects(mask):
-            clipped_rect = clip_rect(rect, gray.shape)
+        for contour, contour_area in contour_shapes(mask):
+            rotated_rect = cv2.minAreaRect(contour)
+            box_points, clipped_rect, rotated_size, angle = expand_rotated_rect(
+                rotated_rect, gray.shape, padding_ratio=padding_ratio
+            )
             if not has_plausible_geometry(
-                clipped_rect,
+                rotated_size,
                 contour_area,
                 image_area=image_area,
                 min_area_ratio=min_area_ratio,
@@ -391,8 +533,17 @@ def find_chip_candidates(
             ):
                 continue
 
-            padded = pad_rect(clipped_rect, gray.shape, padding_ratio=padding_ratio)
-            candidates.append(ChipCandidate(rect=padded, score=score, source=source))
+            rotated_area = float(rotated_size[0] * rotated_size[1])
+            candidates.append(
+                ChipCandidate(
+                    rect=clipped_rect,
+                    box_points=box_points,
+                    angle=angle,
+                    rotated_area=rotated_area,
+                    score=score,
+                    source=source,
+                )
+            )
 
     selected = non_max_suppression(candidates, iou_threshold=nms_iou_threshold)
     selected = sort_rects_reading_order(selected)
@@ -426,6 +577,36 @@ def segment_array(
     return chips
 
 
+def segment_array_with_metadata(
+    image: np.ndarray,
+    input_color: str = "rgb",
+    max_chips: int | None = None,
+) -> list[SegmentedChip]:
+    """
+    从内存图像中分割多个芯片，返回旋转框元数据和透视矫正后的裁剪图。
+    不保存任何本地文件。
+    """
+    if image is None or image.size == 0:
+        raise ValueError("输入图像为空")
+
+    gray = to_gray(image, input_color=input_color)
+    candidates = find_chip_candidates(gray, max_chips=max_chips)
+    chips: list[SegmentedChip] = []
+    for candidate in candidates:
+        chip = crop_rotated_box(image, candidate.box_points)
+        chips.append(
+            SegmentedChip(
+                image=chip,
+                rect=candidate.rect,
+                box_points=candidate.box_points,
+                angle=candidate.angle,
+                score=candidate.score,
+                source=candidate.source,
+            )
+        )
+    return chips
+
+
 def output_path_for_index(output_path: str | Path, index: int, total: int) -> Path:
     path = Path(output_path)
     if total == 1:
@@ -448,8 +629,9 @@ def save_debug_images(
 
     vis = src.copy()
     for index, candidate in enumerate(candidates, start=1):
-        x, y, w, h = candidate.rect
-        cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 0, 255), 2)
+        points = np.array(candidate.box_points, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.polylines(vis, [points], isClosed=True, color=(0, 0, 255), thickness=2)
+        x, y, _, _ = candidate.rect
         cv2.putText(
             vis,
             f"{index}:{candidate.score:.2f}",
