@@ -401,6 +401,31 @@ def find_chip_candidates(
     return selected
 
 
+def segment_array(
+    image: np.ndarray,
+    input_color: str = "rgb",
+    max_chips: int | None = None,
+) -> list[tuple[np.ndarray, Rect]]:
+    """
+    从内存图像中分割多个芯片，不保存任何本地文件。
+    input_color: 'rgb' 或 'bgr'，用于候选检测的灰度转换。
+    返回: [(芯片图像, 矩形), ...]
+    """
+    if image is None or image.size == 0:
+        raise ValueError("输入图像为空")
+
+    gray = to_gray(image, input_color=input_color)
+    candidates = find_chip_candidates(gray, max_chips=max_chips)
+    if not candidates:
+        return []
+
+    chips: list[tuple[np.ndarray, Rect]] = []
+    for candidate in candidates:
+        x, y, w, h = candidate.rect
+        chips.append((image[y : y + h, x : x + w].copy(), candidate.rect))
+    return chips
+
+
 def output_path_for_index(output_path: str | Path, index: int, total: int) -> Path:
     path = Path(output_path)
     if total == 1:

@@ -19,3 +19,6 @@ description/
 *.png
 
 result.json
+*.sqlite3
+
+TODO.md
