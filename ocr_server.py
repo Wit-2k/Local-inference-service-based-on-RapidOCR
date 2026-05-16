@@ -138,13 +138,11 @@ async def health():
 async def shutdown(request: Request):
     client_host = request.client.host if request.client else ""
     if client_host not in {"127.0.0.1", "::1", "localhost"}:
-        return JSONResponse(
-            status_code=403, content={"error": "只允许本机关闭 OCR 服务"}
-        )
+        return JSONResponse(status_code=403, content={"error": "只允许本机关闭"})
 
     def stop_process() -> None:
-        time.sleep(0.2)
-        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(0.3)          # 等待 HTTP 响应发出
+        os._exit(0)              # ✅ 跨平台可靠，直接退出
 
     threading.Thread(target=stop_process, daemon=True).start()
     return {"status": "shutting_down"}

@@ -1,0 +1,65 @@
+<div id="chip-ocr-app">
+    <div class="app-header">
+        <h1 style="color: #2c2c2c">实时 OCR 摄像头识别</h1>
+        <div class="status-pill" data-role="status">
+            OCR 服务未启动
+        </div>
+    </div>
+    <div class="workspace">
+        <section class="panel">
+            <div class="panel-title">摄像头原始流</div>
+            <div class="media-slot">
+                <video data-role="video" autoplay playsinline muted></video>
+                <div class="empty-state" data-role="camera-empty">
+                    摄像头未启动
+                </div>
+            </div>
+        </section>
+        <section class="panel">
+            <div class="panel-title">识别框预览</div>
+            <div class="media-slot">
+                <img
+                    class="annotated-image is-empty"
+                    data-role="annotated"
+                    alt="识别框预览"
+                />
+                <div class="empty-state" data-role="preview-empty">
+                    等待识别结果
+                </div>
+            </div>
+        </section>
+    </div>
+    <div class="controls">
+        <button class="camera-button" data-role="camera-button">
+            启动摄像头
+        </button>
+        <button class="start-button" data-role="start-button">
+            开启实时识别
+        </button>
+        <button class="pause-button" data-role="pause-button">
+            暂停实时识别
+        </button>
+        <button class="stop-button" data-role="stop-button">
+            停止 OCR 服务
+        </button>
+    </div>
+    <section class="results-panel">
+        <div class="results-header">
+            <h2>识别结果</h2>
+            <span class="summary" data-role="summary">暂无结果</span>
+        </div>
+        <div class="chip-grid" data-role="results"></div>
+    </section>
+    <section class="history-panel">
+        <div class="results-header">
+            <h2>成功识别历史</h2>
+            <span class="summary" data-role="history-summary">0 条记录</span>
+        </div>
+        <div class="history-window" data-role="history">
+            <div class="history-empty" data-role="history-empty">
+                暂无匹配记录
+            </div>
+        </div>
+    </section>
+    <canvas data-role="canvas" hidden></canvas>
+</div>

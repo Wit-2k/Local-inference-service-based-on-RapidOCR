@@ -115,29 +115,56 @@ def ensure_ocr_service(
     raise TimeoutError("OCR 服务启动超时")
 
 
+def wait_for_port_free(
+    port: int = PORT, timeout: float = 8.0, interval: float = 0.2
+) -> bool:
+    """等待端口释放，用于确认 OCR 服务已经真正退出。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not is_port_in_use(port):
+            return True
+        time.sleep(interval)
+    return not is_port_in_use(port)
+
+
 def shutdown_server(process: subprocess.Popen | None) -> bool:
-    """关闭由当前程序启动的 OCR 服务子进程。"""
-    if process is None or process.poll() is not None:
+    """强制终止 OCR 服务进程及其整个进程树。"""
+    if process is None:
         return False
 
-    process.terminate()
+    pid = process.pid
+    poll = process.poll()
+
+    if poll is not None:
+        return False
+
+    if sys.platform == "win32":
+        cmd = ["taskkill", "/F", "/T", "/PID", str(pid)]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    else:
+        import signal, os
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            process.kill()
+
     try:
         process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=5)
-    print("👋 OCR 服务已关闭")
+    except Exception as e:
+        print(f"[shutdown] wait 超时: {e}")
+
     return True
 
 
-def request_server_shutdown(timeout: float = 2.0) -> bool:
+def request_server_shutdown(timeout: float = 2.0, wait_timeout: float = 8.0) -> bool:
     """请求本机 OCR 服务自行关闭，用于页面手动停止常驻服务。"""
     try:
         response = requests.post(SHUTDOWN_URL, timeout=timeout)
         response.raise_for_status()
     except requests.RequestException:
         return False
-    return True
+    return wait_for_port_free(timeout=wait_timeout)
 
 
 def save_result(

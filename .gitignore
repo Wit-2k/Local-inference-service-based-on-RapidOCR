@@ -22,3 +22,9 @@ result.json
 *.sqlite3
 
 TODO.md
+
+*.ps1
+
+*.log
+
+my_log.py
