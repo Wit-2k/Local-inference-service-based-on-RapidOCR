@@ -19,6 +19,7 @@ CandidateMask = tuple[str, np.ndarray]
 
 DARK_CLOSE_KERNELS: tuple[tuple[int, int], ...] = ((9, 9), (21, 11), (41, 17))
 EDGE_CLOSE_KERNELS: tuple[tuple[int, int], ...] = ((7, 7), (15, 15), (31, 15))
+REALTIME_DARK_CLOSE_KERNELS: tuple[tuple[int, int], ...] = ((9, 9), (21, 11))
 MIN_DARK_RATIO = 0.22
 MIN_CENTER_BORDER_CONTRAST = 25.0
 MAX_BORDER_TOUCHING_AREA_RATIO = 0.08
@@ -134,7 +135,13 @@ def auto_canny(gray: np.ndarray, sigma: float = 0.33) -> np.ndarray:
     return cv2.Canny(gray, lower, upper)
 
 
-def build_candidate_masks(gray: np.ndarray) -> list[CandidateMask]:
+def build_candidate_masks(
+    gray: np.ndarray,
+    *,
+    include_edges: bool = True,
+    dark_close_kernels: tuple[tuple[int, int], ...] = DARK_CLOSE_KERNELS,
+    edge_close_kernels: tuple[tuple[int, int], ...] = EDGE_CLOSE_KERNELS,
+) -> list[CandidateMask]:
     """
     构造多路候选掩码：
     - dark: 暗区域阈值，适合黑色芯片主体清晰的场景
@@ -148,7 +155,7 @@ def build_candidate_masks(gray: np.ndarray) -> list[CandidateMask]:
     masks: list[CandidateMask] = [("dark", dark)]
 
     open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    for kernel_size in DARK_CLOSE_KERNELS:
+    for kernel_size in dark_close_kernels:
         close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, kernel_size)
         closed_dark = cv2.morphologyEx(
             dark_base, cv2.MORPH_CLOSE, close_kernel, iterations=2
@@ -158,8 +165,11 @@ def build_candidate_masks(gray: np.ndarray) -> list[CandidateMask]:
         )
         masks.append((f"dark_close_{kernel_size[0]}x{kernel_size[1]}", closed_dark))
 
+    if not include_edges:
+        return masks
+
     edges = auto_canny(blur)
-    for kernel_size in EDGE_CLOSE_KERNELS:
+    for kernel_size in edge_close_kernels:
         close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, kernel_size)
         closed = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, close_kernel, iterations=2)
         closed = cv2.dilate(closed, close_kernel, iterations=1)
@@ -494,6 +504,9 @@ def find_chip_candidates(
     nms_iou_threshold: float = 0.35,
     padding_ratio: float = 0.08,
     max_chips: int | None = None,
+    include_edge_masks: bool = True,
+    dark_close_kernels: tuple[tuple[int, int], ...] = DARK_CLOSE_KERNELS,
+    edge_close_kernels: tuple[tuple[int, int], ...] = EDGE_CLOSE_KERNELS,
 ) -> list[ChipCandidate]:
     """
     检测多个芯片候选框。
@@ -505,7 +518,12 @@ def find_chip_candidates(
     min_side = max(20, int(round(min(image_h, image_w) * min_side_ratio)))
     candidates: list[ChipCandidate] = []
 
-    for source, mask in build_candidate_masks(gray):
+    for source, mask in build_candidate_masks(
+        gray,
+        include_edges=include_edge_masks,
+        dark_close_kernels=dark_close_kernels,
+        edge_close_kernels=edge_close_kernels,
+    ):
         for contour, contour_area in contour_shapes(mask):
             rotated_rect = cv2.minAreaRect(contour)
             box_points, clipped_rect, rotated_size, angle = expand_rotated_rect(
@@ -581,6 +599,7 @@ def segment_array_with_metadata(
     image: np.ndarray,
     input_color: str = "rgb",
     max_chips: int | None = None,
+    realtime: bool = False,
 ) -> list[SegmentedChip]:
     """
     从内存图像中分割多个芯片，返回旋转框元数据和透视矫正后的裁剪图。
@@ -590,7 +609,16 @@ def segment_array_with_metadata(
         raise ValueError("输入图像为空")
 
     gray = to_gray(image, input_color=input_color)
-    candidates = find_chip_candidates(gray, max_chips=max_chips)
+    if realtime:
+        candidates = find_chip_candidates(
+            gray,
+            max_chips=max_chips,
+            include_edge_masks=False,
+            dark_close_kernels=REALTIME_DARK_CLOSE_KERNELS,
+            min_score=0.38,
+        )
+    else:
+        candidates = find_chip_candidates(gray, max_chips=max_chips)
     chips: list[SegmentedChip] = []
     for candidate in candidates:
         chip = crop_rotated_box(image, candidate.box_points)

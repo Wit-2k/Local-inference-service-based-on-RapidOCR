@@ -1,6 +1,7 @@
 """Gradio 摄像头实时 OCR 展示页。"""
 
 import base64
+import copy
 import json
 import os
 import subprocess
@@ -56,6 +57,14 @@ GRADIO_SERVER_NAME = "127.0.0.1"
 GRADIO_SERVER_PORT = 7860
 RAW_CAMERA_FPS = 30.0
 MAX_OCR_WORKERS = 4
+REALTIME_MAX_CHIPS = 3
+OCR_MAX_IMAGE_SIDE = 512
+PREVIEW_MAX_IMAGE_SIDE = 1280
+OCR_CACHE_IOU_THRESHOLD = 0.72
+FRAME_DIFF_WIDTH = 160
+FRAME_DIFF_MEAN_THRESHOLD = 2.5
+FRAME_DIFF_PIXEL_THRESHOLD = 12
+FRAME_DIFF_CHANGED_RATIO_THRESHOLD = 0.015
 JPEG_QUALITY = 86
 WEBCAM_CONSTRAINTS = {
     "video": {
@@ -80,6 +89,12 @@ def build_webrtc_js() -> str:
         "__WEBCAM_CONSTRAINTS__": json.dumps(WEBCAM_CONSTRAINTS, ensure_ascii=False),
         "__CAPTURE_INTERVAL_MS__": str(int(DEFAULT_CAPTURE_INTERVAL_SECONDS * 1000)),
         "__JPEG_QUALITY__": f"{JPEG_QUALITY / 100:.2f}",
+        "__FRAME_DIFF_WIDTH__": str(FRAME_DIFF_WIDTH),
+        "__FRAME_DIFF_MEAN_THRESHOLD__": f"{FRAME_DIFF_MEAN_THRESHOLD:.3f}",
+        "__FRAME_DIFF_PIXEL_THRESHOLD__": str(FRAME_DIFF_PIXEL_THRESHOLD),
+        "__FRAME_DIFF_CHANGED_RATIO_THRESHOLD__": (
+            f"{FRAME_DIFF_CHANGED_RATIO_THRESHOLD:.5f}"
+        ),
     }
     js = load_text_asset(DISPLAY_JS_PATH)
     for token, value in replacements.items():
@@ -96,6 +111,8 @@ WEBRTC_JS = build_webrtc_js()
 server_process: subprocess.Popen | None = None
 server_lock = threading.Lock()
 ocr_stop_requested = False
+ocr_cache_lock = threading.Lock()
+ocr_result_cache: list[dict[str, Any]] = []
 
 
 def start_background_service(*, user_requested: bool = False) -> str:
@@ -126,6 +143,7 @@ def start_background_service(*, user_requested: bool = False) -> str:
 
 
 def start_recognition_service(*args, **kwargs) -> dict[str, str]:
+    clear_ocr_result_cache()
     return {"status": start_background_service(user_requested=True)}
 
 
@@ -140,6 +158,7 @@ def stop_background_service() -> tuple[str, bool]:
         ocr_stop_requested = True
 
         server_process = None
+        clear_ocr_result_cache()
 
         # 兜底：按端口杀
         time.sleep(1)
@@ -182,16 +201,19 @@ def stop_ocr_service_for_ui(*args, **kwargs) -> dict[str, str]:
 
 
 def normalize_frame_request(
-    frame_payload: Any, enabled: bool = True
-) -> tuple[str, bool]:
+    frame_payload: Any, enabled: bool = True, allow_cache: bool = True
+) -> tuple[str, bool, bool]:
     """兼容 Gradio HTML server function 对多参数的打包方式。"""
     payload = frame_payload
     request_enabled = enabled
+    request_allow_cache = allow_cache
 
     for _ in range(4):
         if isinstance(payload, dict):
             if "enabled" in payload:
                 request_enabled = bool(payload["enabled"])
+            if "allow_cache" in payload:
+                request_allow_cache = bool(payload["allow_cache"])
             if "data_url" in payload:
                 payload = payload["data_url"]
                 continue
@@ -208,6 +230,8 @@ def normalize_frame_request(
                 break
             if len(payload) >= 2:
                 request_enabled = bool(payload[1])
+            if len(payload) >= 3:
+                request_allow_cache = bool(payload[2])
             payload = payload[0]
             continue
 
@@ -216,7 +240,7 @@ def normalize_frame_request(
     if not isinstance(payload, str):
         raise ValueError(f"摄像头帧格式无效：收到 {type(payload).__name__}")
 
-    return payload, request_enabled
+    return payload, request_enabled, request_allow_cache
 
 
 def data_url_to_rgb(data_url: str) -> np.ndarray:
@@ -240,6 +264,53 @@ def rgb_to_data_url(image: np.ndarray) -> str:
         raise ValueError("无法编码识别框预览")
     payload = base64.b64encode(encoded.tobytes()).decode("ascii")
     return f"data:image/jpeg;base64,{payload}"
+
+
+def clear_ocr_result_cache() -> None:
+    with ocr_cache_lock:
+        ocr_result_cache.clear()
+
+
+def elapsed_ms(started_at: float) -> float:
+    return round((time.perf_counter() - started_at) * 1000, 2)
+
+
+def resize_long_side(image: np.ndarray, max_side: int) -> np.ndarray:
+    h, w = image.shape[:2]
+    long_side = max(h, w)
+    if max_side <= 0 or long_side <= max_side:
+        return image
+
+    scale = max_side / long_side
+    size = (max(1, int(round(w * scale))), max(1, int(round(h * scale))))
+    return cv2.resize(image, size, interpolation=cv2.INTER_AREA)
+
+
+def rect_area_dict(rect: dict[str, int]) -> int:
+    return max(0, int(rect["w"])) * max(0, int(rect["h"]))
+
+
+def rect_iou_dict(rect_a: dict[str, int], rect_b: dict[str, int]) -> float:
+    ax1, ay1 = int(rect_a["x"]), int(rect_a["y"])
+    ax2, ay2 = ax1 + int(rect_a["w"]), ay1 + int(rect_a["h"])
+    bx1, by1 = int(rect_b["x"]), int(rect_b["y"])
+    bx2, by2 = bx1 + int(rect_b["w"]), by1 + int(rect_b["h"])
+
+    left = max(ax1, bx1)
+    top = max(ay1, by1)
+    right = min(ax2, bx2)
+    bottom = min(ay2, by2)
+    intersection = max(0, right - left) * max(0, bottom - top)
+    if intersection == 0:
+        return 0.0
+
+    union = rect_area_dict(rect_a) + rect_area_dict(rect_b) - intersection
+    return intersection / union if union > 0 else 0.0
+
+
+def rect_dict_from_chip(chip: SegmentedChip) -> dict[str, int]:
+    x, y, w, h = chip.rect
+    return {"x": x, "y": y, "w": w, "h": h}
 
 
 def draw_chip_boxes(image: np.ndarray, chips: list[SegmentedChip]) -> np.ndarray:
@@ -295,10 +366,9 @@ def chip_result_payload(
             texts.append({"text": item.get("text", ""), "score": item.get("score")})
 
     match = match_ocr_payload(ocr_payload or {"result": []})
-    x, y, w, h = chip.rect
     return {
         "index": index,
-        "rect": {"x": x, "y": y, "w": w, "h": h},
+        "rect": rect_dict_from_chip(chip),
         "box_points": [{"x": px, "y": py} for px, py in chip.box_points],
         "angle": chip.angle,
         "segment_score": chip.score,
@@ -310,9 +380,38 @@ def chip_result_payload(
     }
 
 
+def cached_chip_result_payload(
+    index: int,
+    chip: SegmentedChip,
+    cached_entry: dict[str, Any],
+    *,
+    cache_age_ms: float,
+) -> dict[str, Any]:
+    return {
+        "index": index,
+        "rect": rect_dict_from_chip(chip),
+        "box_points": [{"x": px, "y": py} for px, py in chip.box_points],
+        "angle": chip.angle,
+        "segment_score": chip.score,
+        "segment_source": chip.source,
+        "texts": copy.deepcopy(cached_entry["texts"]),
+        "match": copy.deepcopy(cached_entry["match"]),
+        "inference_time_ms": cached_entry.get("inference_time_ms"),
+        "error": None,
+        "cached": True,
+        "timings": {
+            "ocr_wall_ms": 0.0,
+            "cache_age_ms": cache_age_ms,
+            "cached": True,
+        },
+    }
+
+
 def recognize_chip(index: int, chip: SegmentedChip) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    ocr_image = resize_long_side(chip.image, OCR_MAX_IMAGE_SIDE)
     try:
-        payload = recognize_array(chip.image, save_path=None)
+        payload = recognize_array(ocr_image, save_path=None)
     except (
         RuntimeError,
         ValueError,
@@ -320,111 +419,221 @@ def recognize_chip(index: int, chip: SegmentedChip) -> dict[str, Any]:
         TimeoutError,
         OSError,
     ) as exc:
-        return chip_result_payload(index, chip, None, error=f"识别失败：{exc}")
-    return chip_result_payload(index, chip, payload)
+        result = chip_result_payload(index, chip, None, error=f"识别失败：{exc}")
+        result["timings"] = {"ocr_wall_ms": elapsed_ms(started_at)}
+        return result
+
+    result = chip_result_payload(index, chip, payload)
+    result["timings"] = {
+        "ocr_wall_ms": elapsed_ms(started_at),
+        "ocr_input_width": int(ocr_image.shape[1]),
+        "ocr_input_height": int(ocr_image.shape[0]),
+        "cached": False,
+    }
+    return result
 
 
-def recognize_chips_parallel(
+def cached_results_for_chips(
     chips: list[SegmentedChip],
+) -> dict[int, dict[str, Any]]:
+    now = time.monotonic()
+    with ocr_cache_lock:
+        entries = copy.deepcopy(ocr_result_cache)
+
+    results: dict[int, dict[str, Any]] = {}
+    used_cache_indexes: set[int] = set()
+    for index, chip in enumerate(chips, start=1):
+        rect = rect_dict_from_chip(chip)
+        best_index: int | None = None
+        best_iou = 0.0
+        for cache_index, entry in enumerate(entries):
+            if cache_index in used_cache_indexes:
+                continue
+            iou = rect_iou_dict(rect, entry["rect"])
+            if iou > best_iou:
+                best_iou = iou
+                best_index = cache_index
+
+        if best_index is None or best_iou < OCR_CACHE_IOU_THRESHOLD:
+            continue
+
+        used_cache_indexes.add(best_index)
+        cache_age_ms = round((now - float(entries[best_index]["stored_at"])) * 1000, 2)
+        results[index] = cached_chip_result_payload(
+            index,
+            chip,
+            entries[best_index],
+            cache_age_ms=cache_age_ms,
+        )
+
+    return results
+
+
+def cache_ocr_result(chip: SegmentedChip, result: dict[str, Any]) -> None:
+    if not result.get("match", {}).get("part_number"):
+        return
+
+    entry = {
+        "rect": rect_dict_from_chip(chip),
+        "texts": copy.deepcopy(result.get("texts", [])),
+        "match": copy.deepcopy(result.get("match", {})),
+        "inference_time_ms": result.get("inference_time_ms"),
+        "stored_at": time.monotonic(),
+    }
+    with ocr_cache_lock:
+        ocr_result_cache.append(entry)
+        ocr_result_cache[:] = ocr_result_cache[-REALTIME_MAX_CHIPS:]
+
+
+def recognize_chips_with_cache(
+    chips: list[SegmentedChip], *, allow_cache: bool = True
 ) -> list[dict[str, Any]]:
     if not chips:
         return []
 
-    max_workers = min(MAX_OCR_WORKERS, len(chips))
-    results: list[dict[str, Any]] = []
+    if allow_cache:
+        results_by_index = cached_results_for_chips(chips)
+    else:
+        clear_ocr_result_cache()
+        results_by_index = {}
+    chips_to_recognize = [
+        (index, chip)
+        for index, chip in enumerate(chips, start=1)
+        if index not in results_by_index
+    ]
+
+    if not chips_to_recognize:
+        return [results_by_index[index] for index in sorted(results_by_index)]
+
+    max_workers = min(MAX_OCR_WORKERS, len(chips_to_recognize))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
             executor.submit(recognize_chip, index, chip): index
-            for index, chip in enumerate(chips, start=1)
+            for index, chip in chips_to_recognize
         }
         for future in as_completed(futures):
-            results.append(future.result())
-    return sorted(results, key=lambda item: item["index"])
+            result = future.result()
+            index = futures[future]
+            results_by_index[index] = result
+            cache_ocr_result(chips[index - 1], result)
+
+    return [results_by_index[index] for index in sorted(results_by_index)]
 
 
-def recognize_multi_chip_frame(data_url: Any, enabled: bool = True) -> dict[str, Any]:
-    try:
-        data_url, enabled = normalize_frame_request(data_url, enabled)
-    except ValueError as exc:
+def recognize_multi_chip_frame(
+    data_url: Any, enabled: bool = True, allow_cache: bool = True
+) -> dict[str, Any]:
+    started_at = time.perf_counter()
+    timings: dict[str, Any] = {}
+
+    def finish(
+        *,
+        status: str,
+        summary: str,
+        chips: list[dict[str, Any]] | None = None,
+        annotated_image: str | None = None,
+    ) -> dict[str, Any]:
+        timings["total_ms"] = elapsed_ms(started_at)
         return {
-            "status": f"摄像头帧无效：{exc}",
-            "summary": "未完成识别",
-            "chips": [],
-            "annotated_image": None,
+            "status": status,
+            "summary": summary,
+            "chips": chips or [],
+            "annotated_image": annotated_image,
+            "timings": dict(timings),
         }
+
+    try:
+        step_started = time.perf_counter()
+        data_url, enabled, allow_cache = normalize_frame_request(
+            data_url, enabled, allow_cache
+        )
+        timings["request_ms"] = elapsed_ms(step_started)
+    except ValueError as exc:
+        return finish(status=f"摄像头帧无效：{exc}", summary="未完成识别")
 
     if not enabled:
-        return {
-            "status": "实时识别已暂停",
-            "summary": "暂无结果",
-            "chips": [],
-            "annotated_image": None,
-        }
+        return finish(status="实时识别已暂停", summary="暂无结果")
 
-    started_at = time.perf_counter()
     try:
+        step_started = time.perf_counter()
         frame_rgb = data_url_to_rgb(data_url)
+        timings["decode_ms"] = elapsed_ms(step_started)
     except ValueError as exc:
-        return {
-            "status": f"摄像头帧无效：{exc}",
-            "summary": "未完成识别",
-            "chips": [],
-            "annotated_image": None,
-        }
+        return finish(status=f"摄像头帧无效：{exc}", summary="未完成识别")
 
     try:
-        chips = segment_array_with_metadata(frame_rgb, input_color="rgb")
+        step_started = time.perf_counter()
+        chips = segment_array_with_metadata(
+            frame_rgb,
+            input_color="rgb",
+            max_chips=REALTIME_MAX_CHIPS,
+            realtime=True,
+        )
+        timings["segment_ms"] = elapsed_ms(step_started)
     except RuntimeError as exc:
-        return {
-            "status": f"分割失败：{exc}",
-            "summary": "未完成识别",
-            "chips": [],
-            "annotated_image": None,
-        }
+        return finish(status=f"分割失败：{exc}", summary="未完成识别")
 
+    step_started = time.perf_counter()
     annotated = draw_chip_boxes(frame_rgb, chips) if chips else frame_rgb
-    annotated_image = rgb_to_data_url(annotated)
+    annotated_image = rgb_to_data_url(
+        resize_long_side(annotated, PREVIEW_MAX_IMAGE_SIDE)
+    )
+    timings["preview_ms"] = elapsed_ms(step_started)
 
     if not chips:
-        return {
-            "status": "未检测到芯片候选区域",
-            "summary": "检测到 0 个芯片",
-            "chips": [],
-            "annotated_image": annotated_image,
-        }
+        return finish(
+            status="未检测到芯片候选区域",
+            summary="检测到 0 个芯片",
+            annotated_image=annotated_image,
+        )
 
+    step_started = time.perf_counter()
     if not is_ocr_ready():
         if is_ocr_stop_requested():
-            return {
-                "status": "OCR 服务已手动停止",
-                "summary": f"检测到 {len(chips)} 个芯片，OCR 服务未运行",
-                "chips": [
+            timings["service_ms"] = elapsed_ms(step_started)
+            return finish(
+                status="OCR 服务已手动停止",
+                summary=f"检测到 {len(chips)} 个芯片，OCR 服务未运行",
+                chips=[
                     chip_result_payload(index, chip, None, error="OCR 服务已停止")
                     for index, chip in enumerate(chips, start=1)
                 ],
-                "annotated_image": annotated_image,
-            }
+                annotated_image=annotated_image,
+            )
         service_status = start_background_service()
         if not is_ocr_ready():
-            return {
-                "status": service_status,
-                "summary": f"检测到 {len(chips)} 个芯片，OCR 服务不可用",
-                "chips": [
+            timings["service_ms"] = elapsed_ms(step_started)
+            return finish(
+                status=service_status,
+                summary=f"检测到 {len(chips)} 个芯片，OCR 服务不可用",
+                chips=[
                     chip_result_payload(index, chip, None, error="OCR 服务不可用")
                     for index, chip in enumerate(chips, start=1)
                 ],
-                "annotated_image": annotated_image,
-            }
+                annotated_image=annotated_image,
+            )
+    timings["service_ms"] = elapsed_ms(step_started)
 
-    chip_results = recognize_chips_parallel(chips)
-    elapsed_ms = round((time.perf_counter() - started_at) * 1000, 2)
+    step_started = time.perf_counter()
+    chip_results = recognize_chips_with_cache(chips, allow_cache=allow_cache)
+    timings["ocr_ms"] = elapsed_ms(step_started)
+    cached_count = sum(1 for item in chip_results if item.get("cached"))
+    timings["cache_hits"] = cached_count
+    timings["ocr_real_count"] = len(chip_results) - cached_count
+    total_ms = elapsed_ms(started_at)
     matched_count = sum(1 for item in chip_results if item["match"].get("part_number"))
-    return {
-        "status": f"检测到 {len(chips)} 个芯片，用时 {elapsed_ms} ms",
-        "summary": f"{len(chips)} 个芯片，{matched_count} 个型号匹配",
-        "chips": chip_results,
-        "annotated_image": annotated_image,
-    }
+    cache_text = f"，复用 {cached_count}" if cached_count else ""
+    status = (
+        f"检测到 {len(chips)} 个芯片，用时 {total_ms} ms"
+        f"（分割 {timings.get('segment_ms', 0)} ms，"
+        f"OCR {timings.get('ocr_ms', 0)} ms{cache_text}）"
+    )
+    return finish(
+        status=status,
+        summary=f"{len(chips)} 个芯片，{matched_count} 个型号匹配",
+        chips=chip_results,
+        annotated_image=annotated_image,
+    )
 
 
 def build_demo() -> gr.Blocks:

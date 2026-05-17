@@ -17,8 +17,14 @@ const stopButton = app.querySelector('[data-role="stop-button"]');
 const constraints = __WEBCAM_CONSTRAINTS__;
 const intervalMs = __CAPTURE_INTERVAL_MS__;
 const jpegQuality = __JPEG_QUALITY__;
+const frameDiffWidth = __FRAME_DIFF_WIDTH__;
+const frameDiffMeanThreshold = __FRAME_DIFF_MEAN_THRESHOLD__;
+const frameDiffPixelThreshold = __FRAME_DIFF_PIXEL_THRESHOLD__;
+const frameDiffChangedRatioThreshold = __FRAME_DIFF_CHANGED_RATIO_THRESHOLD__;
 const maxHistoryRecords = 20;
 const historyDedupeMs = 3000;
+const motionCanvas = document.createElement('canvas');
+const motionContext = motionCanvas.getContext('2d', {willReadFrequently: true});
 let stream = null;
 let recognizeTimer = null;
 let recognizing = false;
@@ -26,6 +32,8 @@ let requestInFlight = false;
 let historyRecordCount = 0;
 let lastHistorySignature = '';
 let lastHistoryAt = 0;
+let previousMotionLuma = null;
+let hasCompleteRecognitionResult = false;
 
 function setStatus(message) {
     statusEl.textContent = message;
@@ -71,6 +79,11 @@ function setPreview(src) {
 function clearResults(message = '暂无结果') {
     summaryEl.textContent = message;
     resultsEl.replaceChildren();
+}
+
+function resetFrameDiffState() {
+    previousMotionLuma = null;
+    hasCompleteRecognitionResult = false;
 }
 
 function addText(parent, tag, text, className = '') {
@@ -150,6 +163,24 @@ function appendMatchedHistory(payload) {
     updateHistorySummary();
 }
 
+function canSkipStableFrame(payload) {
+    if (!payload || !payload.annotated_image) return false;
+    const chips = payload.chips || [];
+    if (!chips.length) return false;
+    if (!chips.every((chip) => chip.match && chip.match.part_number)) return false;
+
+    const status = payload.status || '';
+    return !(
+        status.includes('摄像头帧无效') ||
+        status.includes('分割失败') ||
+        status.includes('OCR 服务不可用') ||
+        status.includes('OCR 服务已手动停止') ||
+        status.includes('OCR 服务启动失败') ||
+        status.includes('未收到识别结果') ||
+        status.includes('未完成识别')
+    );
+}
+
 function renderResults(payload) {
     payload = normalizeServerPayload(payload, {
         status: '未收到识别结果',
@@ -189,9 +220,64 @@ function renderResults(payload) {
         if (match.normalized_text) {
             addText(card, 'div', `清洗文本：${match.normalized_text}`, 'muted');
         }
+        if (chip.cached && chip.timings && chip.timings.cache_age_ms != null) {
+            addText(card, 'div', `OCR 结果复用：${chip.timings.cache_age_ms} ms 前`, 'muted');
+        } else if (chip.timings && chip.timings.ocr_wall_ms != null) {
+            addText(card, 'div', `OCR 请求用时：${chip.timings.ocr_wall_ms} ms`, 'muted');
+        }
         resultsEl.appendChild(card);
     }
     appendMatchedHistory(payload);
+    hasCompleteRecognitionResult = canSkipStableFrame(payload);
+}
+
+function sampleFrameDiff() {
+    if (!motionContext || !video.videoWidth || !video.videoHeight) {
+        return {stable: false, meanDelta: null, changedRatio: null};
+    }
+
+    const width = Math.max(1, Math.min(frameDiffWidth, video.videoWidth));
+    const height = Math.max(1, Math.round(video.videoHeight * width / video.videoWidth));
+    if (motionCanvas.width !== width || motionCanvas.height !== height) {
+        motionCanvas.width = width;
+        motionCanvas.height = height;
+        previousMotionLuma = null;
+    }
+
+    motionContext.drawImage(video, 0, 0, width, height);
+    const pixels = motionContext.getImageData(0, 0, width, height).data;
+    const current = new Uint8Array(width * height);
+
+    for (let source = 0, target = 0; source < pixels.length; source += 4, target += 1) {
+        current[target] = Math.round(
+            pixels[source] * 0.299 +
+            pixels[source + 1] * 0.587 +
+            pixels[source + 2] * 0.114
+        );
+    }
+
+    if (!previousMotionLuma || previousMotionLuma.length !== current.length) {
+        previousMotionLuma = current;
+        return {stable: false, meanDelta: null, changedRatio: null};
+    }
+
+    let totalDelta = 0;
+    let changedPixels = 0;
+    for (let index = 0; index < current.length; index += 1) {
+        const delta = Math.abs(current[index] - previousMotionLuma[index]);
+        totalDelta += delta;
+        if (delta > frameDiffPixelThreshold) changedPixels += 1;
+    }
+    previousMotionLuma = current;
+
+    const meanDelta = totalDelta / current.length;
+    const changedRatio = changedPixels / current.length;
+    return {
+        stable: meanDelta < frameDiffMeanThreshold &&
+            changedRatio < frameDiffChangedRatioThreshold,
+        meanDelta,
+        changedRatio,
+    };
 }
 
 async function startCamera() {
@@ -226,13 +312,19 @@ async function captureAndRecognize() {
 
     requestInFlight = true;
     try {
+        const frameDiff = sampleFrameDiff();
+        if (hasCompleteRecognitionResult && frameDiff.stable) {
+            setStatus('画面稳定，全部芯片已识别，跳过识别（沿用上次结果）');
+            return;
+        }
+
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
         canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
         const frame = canvas.toDataURL('image/jpeg', jpegQuality);
         const payload = await callServer(
             'recognize_multi_chip_frame',
-            [frame, recognizing],
+            [frame, recognizing, Boolean(frameDiff.stable)],
             {
                 status: '未收到识别结果',
                 summary: '暂无结果',
@@ -252,6 +344,7 @@ async function startRecognition() {
     startButton.disabled = true;
     try {
         await startCamera();
+        resetFrameDiffState();
         const service = await callServer(
             'start_recognition_service',
             [],
@@ -272,11 +365,13 @@ async function startRecognition() {
 
 function pauseRecognition() {
     stopRecognitionLoop();
+    resetFrameDiffState();
     setStatus('实时识别已暂停');
 }
 
 async function stopService() {
     stopRecognitionLoop();
+    resetFrameDiffState();
     stopButton.disabled = true;
     try {
         const payload = await callServer(
