@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -10,6 +11,8 @@ from typing import Iterable
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_DB_PATH = PROJECT_DIR / "chip_rules.sqlite3"
+DEFAULT_RULES_CSV_PATH = PROJECT_DIR / "chip_rules.csv"
+RULE_COLUMNS = ("part_number", "pattern", "description", "priority", "enabled")
 
 
 @dataclass(frozen=True)
@@ -21,16 +24,22 @@ class ChipRule:
     enabled: bool
 
 
-def connect(db_path: str | Path = DEFAULT_DB_PATH) -> sqlite3.Connection:
+def connect(
+    db_path: str | Path = DEFAULT_DB_PATH,
+    rules_csv_path: str | Path = DEFAULT_RULES_CSV_PATH,
+) -> sqlite3.Connection:
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)
     connection.row_factory = sqlite3.Row
-    initialize_database(connection)
+    initialize_database(connection, rules_csv_path=rules_csv_path)
     return connection
 
 
-def initialize_database(connection: sqlite3.Connection) -> None:
+def initialize_database(
+    connection: sqlite3.Connection,
+    rules_csv_path: str | Path = DEFAULT_RULES_CSV_PATH,
+) -> None:
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS chip_rules (
@@ -42,26 +51,113 @@ def initialize_database(connection: sqlite3.Connection) -> None:
         )
         """
     )
-    rules: list[tuple[str, str, str, int, int]] = [
-        # (part_number, pattern, description, priority, enabled)
-        ("SN74LS00N", "74[0-9A-Z]{2}00", "Quad 2-input NAND gate", 10, 1),
-        ("SN74LS266N", "74[0-9A-Z]{2}266", "4-bit synchronous binary counter", 10, 1),
-        ("SN74LS138N", "74[0-9A-Z]{2}138", "3-to-8 line decoder", 10, 1),
-        ("SN74LS161N", "74[0-9A-Z]{2}161", "4-bit synchronous up/down counter", 10, 1),
-        ("STC89C52RC", "89C52", "8051 microcontroller", 10, 1),
-        # 继续在此添加更多规则...
-    ]
+    sync_rules_from_csv_if_changed(connection, rules_csv_path)
+    connection.commit()
 
+
+def sync_rules_from_csv_if_changed(
+    connection: sqlite3.Connection,
+    rules_csv_path: str | Path = DEFAULT_RULES_CSV_PATH,
+) -> None:
+    csv_rules = _load_rule_rows_from_csv(rules_csv_path)
+    db_rules = [
+        (
+            str(row["part_number"]),
+            str(row["pattern"]),
+            str(row["description"]),
+            int(row["priority"]),
+            int(row["enabled"]),
+        )
+        for row in connection.execute(
+            """
+            SELECT part_number, pattern, description, priority, enabled
+            FROM chip_rules
+            ORDER BY part_number ASC
+            """
+        )
+    ]
+    if db_rules == csv_rules:
+        return
+
+    connection.execute("DELETE FROM chip_rules")
     connection.executemany(
         """
-        INSERT OR IGNORE INTO chip_rules (
+        INSERT INTO chip_rules (
             part_number, pattern, description, priority, enabled
         )
         VALUES (?, ?, ?, ?, ?)
         """,
-        rules,
+        csv_rules,
     )
-    connection.commit()
+
+
+def _load_rule_rows_from_csv(
+    rules_csv_path: str | Path = DEFAULT_RULES_CSV_PATH,
+) -> list[tuple[str, str, str, int, int]]:
+    path = Path(rules_csv_path)
+    if not path.exists():
+        raise FileNotFoundError(f"芯片型号规则文件不存在: {path}")
+
+    with path.open("r", encoding="utf-8-sig", newline="") as file:
+        reader = csv.DictReader(file)
+        missing_columns = [
+            column
+            for column in RULE_COLUMNS
+            if column not in (reader.fieldnames or [])
+        ]
+        if missing_columns:
+            missing = ", ".join(missing_columns)
+            raise ValueError(f"芯片型号规则文件缺少列: {missing}")
+
+        rules: list[tuple[str, str, str, int, int]] = []
+        seen_part_numbers: set[str] = set()
+        for line_number, row in enumerate(reader, start=2):
+            if not any((value or "").strip() for value in row.values()):
+                continue
+
+            part_number = (row.get("part_number") or "").strip().upper()
+            pattern = (row.get("pattern") or "").strip()
+            priority_text = (row.get("priority") or "").strip()
+            enabled_text = (row.get("enabled") or "1").strip().lower()
+            if not part_number or not pattern:
+                raise ValueError(f"芯片型号规则第 {line_number} 行缺少 part_number 或 pattern")
+            if part_number in seen_part_numbers:
+                raise ValueError(f"芯片型号规则第 {line_number} 行重复定义: {part_number}")
+
+            try:
+                priority = int(priority_text) if priority_text else 100
+            except ValueError as exc:
+                raise ValueError(
+                    f"芯片型号规则第 {line_number} 行 priority 必须是整数"
+                ) from exc
+
+            if enabled_text in {"1", "true", "yes", "y", "on", "启用"}:
+                enabled = 1
+            elif enabled_text in {"0", "false", "no", "n", "off", "禁用"}:
+                enabled = 0
+            else:
+                raise ValueError(
+                    f"芯片型号规则第 {line_number} 行 enabled 只能填写 "
+                    "1/0、true/false 或启用/禁用"
+                )
+
+            try:
+                re.compile(pattern)
+            except re.error as exc:
+                raise ValueError(f"芯片型号规则第 {line_number} 行正则无效: {exc}") from exc
+
+            seen_part_numbers.add(part_number)
+            rules.append(
+                (
+                    part_number,
+                    pattern,
+                    (row.get("description") or "").strip(),
+                    priority,
+                    enabled,
+                )
+            )
+
+    return sorted(rules, key=lambda rule: rule[0])
 
 
 def iter_enabled_rules(
@@ -98,7 +194,7 @@ def match_text(
     connection = connect(db_path)
     try:
         for rule in iter_enabled_rules(connection):
-            match = re.search(rule.pattern, normalized)
+            match = re.search(rule.pattern, normalized, flags=re.IGNORECASE)
             if match:
                 return {
                     "normalized_text": normalized,

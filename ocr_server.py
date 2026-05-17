@@ -32,8 +32,6 @@ def build_ocr_params() -> dict[str, Any]:
             }
         )
     params["Det.limit_side_len"] = LIMIT_SIDE_LEN
-    # params["Det.thresh"] = 0.1
-    # params["Det.box_thresh"] = 0.1
     return params
 
 

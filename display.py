@@ -25,13 +25,10 @@ from capture import (
 )
 from chip_db import match_ocr_payload
 from ocr_client import (
-    PORT,
     ensure_ocr_service,
     is_ocr_ready,
     recognize_array,
-    request_server_shutdown,
     shutdown_server,
-    wait_for_port_free
 )
 from segment import SegmentedChip, segment_array_with_metadata
 
@@ -142,7 +139,6 @@ def stop_background_service() -> tuple[str, bool]:
     with server_lock:
         ocr_stop_requested = True
 
-        stopped = shutdown_server(server_process)
         server_process = None
 
         # 兜底：按端口杀

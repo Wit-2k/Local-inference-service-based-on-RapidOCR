@@ -137,17 +137,9 @@ def shutdown_server(process: subprocess.Popen | None) -> bool:
 
     if poll is not None:
         return False
-
-    if sys.platform == "win32":
-        cmd = ["taskkill", "/F", "/T", "/PID", str(pid)]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-    else:
-        import signal, os
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            process.kill()
+    
+    cmd = ["taskkill", "/F", "/T", "/PID", str(pid)]        
+    subprocess.run(cmd, capture_output=True, text=True, timeout=10)
 
     try:
         process.wait(timeout=5)
