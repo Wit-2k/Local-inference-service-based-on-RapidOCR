@@ -308,15 +308,6 @@ def ocr_max_side_for_chip(image: np.ndarray) -> int:
     return OCR_MAX_IMAGE_SIDE
 
 
-def ocr_payload_has_text(payload: dict[str, Any] | None) -> bool:
-    if not payload:
-        return False
-    return any(
-        bool(str(item.get("text", "")).strip())
-        for item in payload.get("result") or []
-    )
-
-
 def rect_area_dict(rect: dict[str, int]) -> int:
     return max(0, int(rect["w"])) * max(0, int(rect["h"]))
 
@@ -491,14 +482,8 @@ def recognize_chip(index: int, chip: SegmentedChip) -> dict[str, Any]:
     started_at = time.perf_counter()
     ocr_max_side = ocr_max_side_for_chip(chip.image)
     ocr_image = resize_long_side(chip.image, ocr_max_side)
-    used_enhance_fallback = False
     try:
-        payload = recognize_array(ocr_image, save_path=None)
-        if not ocr_payload_has_text(payload):
-            fallback_payload = recognize_array(ocr_image, save_path=None, enhance=True)
-            if ocr_payload_has_text(fallback_payload):
-                payload = fallback_payload
-                used_enhance_fallback = True
+        payload = recognize_array(ocr_image, save_path=None, enhance=True)
     except (
         RuntimeError,
         ValueError,
@@ -516,7 +501,7 @@ def recognize_chip(index: int, chip: SegmentedChip) -> dict[str, Any]:
         "ocr_input_width": int(ocr_image.shape[1]),
         "ocr_input_height": int(ocr_image.shape[0]),
         "ocr_input_max_side": ocr_max_side,
-        "ocr_enhance_fallback": used_enhance_fallback,
+        "ocr_enhance_enabled": True,
         "ocr_preprocess_variant": payload.get("preprocess_variant"),
         "cached": False,
     }

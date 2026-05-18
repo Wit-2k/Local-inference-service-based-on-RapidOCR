@@ -176,7 +176,7 @@ def request_ocr_bytes(
     filename: str = "image.jpg",
     timeout: float = 60.0,
     save_path: str | Path | None = RESULT_PATH,
-    enhance: bool = False,
+    enhance: bool = True,
 ) -> dict[str, Any]:
     """向 OCR 服务提交图片字节并返回 result.json 同构结果。"""
     files = {"file": (filename, image_bytes, "application/octet-stream")}
@@ -196,7 +196,7 @@ def recognize_array(
     image: np.ndarray,
     timeout: float = 60.0,
     save_path: str | Path | None = RESULT_PATH,
-    enhance: bool = False,
+    enhance: bool = True,
 ) -> dict[str, Any]:
     """识别 Gradio/摄像头传入的 numpy 图像。"""
     if image.ndim == 2:
@@ -223,7 +223,7 @@ def recognize_file(
     image_path: str | Path,
     timeout: float = 60.0,
     save_path: str | Path | None = RESULT_PATH,
-    enhance: bool = False,
+    enhance: bool = True,
 ) -> dict[str, Any]:
     """识别本地图片文件。"""
     image_file_path = Path(image_path)
@@ -237,7 +237,7 @@ def recognize_file(
         )
 
 
-def recognize(image_url: str | Path, enhance: bool = False) -> dict[str, Any]:
+def recognize(image_url: str | Path, enhance: bool = True) -> dict[str, Any]:
     """兼容旧入口：识别文件并保存到 result.json。"""
     result = recognize_file(image_url, enhance=enhance)
     print("✅ 已完成，结果保存至 result.json")
@@ -251,9 +251,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--enhance",
-        action="store_false",
-        help="启用芯片激光打标增强，多版本 OCR 后选择最佳结果",
+        dest="enhance",
+        action="store_true",
+        help="启用芯片激光打标增强，多版本 OCR 后选择最佳结果（默认）",
     )
+    parser.add_argument(
+        "--no-enhance",
+        dest="enhance",
+        action="store_false",
+        help="禁用芯片激光打标增强，直接使用原图 OCR",
+    )
+    parser.set_defaults(enhance=True)
     return parser.parse_args()
 
 

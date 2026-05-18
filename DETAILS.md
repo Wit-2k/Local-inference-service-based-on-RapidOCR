@@ -171,7 +171,7 @@ OCR 参数来自 `config.py`：
 - `result`
 - 每个文本项的 `box`、`text`、`score`
 
-如果请求参数 `enhance=true`，会优先使用 `chip_preprocess.py` 生成的 `laser_dark` 变体；只有它没有识别出有效文本时，才会尝试其他预处理变体并选取得分最高的 OCR 结果。
+OCR 服务默认启用 `enhance=true`。它会优先使用 `chip_preprocess.py` 生成的 `laser_dark` 变体；只有它没有识别出有效文本时，才会尝试其他预处理变体并选取得分最高的 OCR 结果。需要对比原图识别时，可以显式传 `enhance=false`。
 
 ### `ocr_client.py`
 
@@ -183,15 +183,15 @@ OCR 服务进程管理和 HTTP 客户端。
 - 启动 `uvicorn ocr_server:app`。
 - 轮询 `/health` 等待 OCR 引擎就绪。
 - 把内存中的芯片图编码成 JPEG 并提交给 `/ocr`。
-- CLI 模式下识别单张图片并保存 `result.json`。
+- CLI 模式下识别单张图片并保存 `result.json`；默认启用增强，可用 `--no-enhance` 对比原图 OCR。
 
 实时页面调用：
 
 ```python
-recognize_array(chip.image, save_path=None)
+recognize_array(chip.image, save_path=None, enhance=True)
 ```
 
-这里 `save_path=None` 表示实时流程不保存 `result.json`。
+这里 `save_path=None` 表示实时流程不保存 `result.json`；`enhance=True` 表示实时识别默认启用芯片激光打标增强。
 
 ### `chip_db.py` 和 `chip_rules.csv`
 
@@ -376,10 +376,10 @@ max_workers = min(4, chip_count)
 每个芯片调用：
 
 ```python
-recognize_array(chip.image, save_path=None)
+recognize_array(chip.image, save_path=None, enhance=True)
 ```
 
-实时链路会先按芯片尺寸选择 OCR 输入上限：普通芯片使用 `OCR_MAX_IMAGE_SIDE`，大芯片或长宽比较大的芯片使用 `OCR_LARGE_CHIP_MAX_IMAGE_SIDE`，避免大芯片激光字被压得太小。若普通 OCR 没有返回任何文本，会再用 `enhance=True` 触发增强兜底；增强流程先跑 `laser_dark`，失败后才从其他变体中选最高分。右侧识别框预览也会按最长边限制缩放后再返回前端。
+实时链路会先按芯片尺寸选择 OCR 输入上限：普通芯片使用 `OCR_MAX_IMAGE_SIDE`，大芯片或长宽比较大的芯片使用 `OCR_LARGE_CHIP_MAX_IMAGE_SIDE`，避免大芯片激光字被压得太小。随后默认以 `enhance=True` 请求 OCR 服务；服务端先跑 `laser_dark`，如果没有识别出有效文本，再从其他变体中选最高分。右侧识别框预览也会按最长边限制缩放后再返回前端。
 
 这里的并发是客户端并发请求，不代表服务端会并发推理。当前 `ocr_server.py` 是单个 FastAPI 进程、单个 uvicorn worker、单个全局 RapidOCR engine。`/ocr` 入口虽然是 `async def`，但内部会同步调用 `engine(img)`。因此多个 OCR 请求到达服务端后通常会排队执行。页面状态中的 `OCR xxx ms` 是客户端等待墙钟时间，包含 HTTP 往返、服务端排队等待和实际 RapidOCR 推理时间；三芯片场景下它可能接近多个真实 OCR 请求耗时之和。
 
@@ -554,7 +554,7 @@ uv run python chip_preprocess.py chip_crop_03.jpg preprocess_variants/
 
 查看七种预处理图，判断文字在哪种图上最清楚。
 
-当前 `/ocr?enhance=true` 会默认优先尝试 `laser_dark`，只有它没有识别出有效文本时才尝试其他变体。若某种预处理长期更好，可以调整 `PREFERRED_ENHANCE_VARIANT` 或 `generate_chip_ocr_variants()` 的变体。
+实时页面默认使用 `/ocr?enhance=true`，服务端会优先尝试 `laser_dark`，只有它没有识别出有效文本时才尝试其他变体。若某种预处理长期更好，可以调整 `PREFERRED_ENHANCE_VARIANT` 或 `generate_chip_ocr_variants()` 的变体。
 
 ### 型号匹配问题
 

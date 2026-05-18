@@ -76,7 +76,7 @@ def run_ocr(img: np.ndarray) -> dict[str, Any]:
     return serialize_ocr_result(result, (time.perf_counter() - start) * 1000)
 
 
-def recognize_image(img: np.ndarray, enhance: bool = False) -> dict[str, Any]:
+def recognize_image(img: np.ndarray, enhance: bool = True) -> dict[str, Any]:
     if not enhance:
         return run_ocr(img)
 
@@ -137,7 +137,7 @@ app = FastAPI(lifespan=lifespan)
 
 
 @app.post("/ocr")
-async def ocr(file: UploadFile = File(...), enhance: bool = False):
+async def ocr(file: UploadFile = File(...), enhance: bool = True):
     """接收上传图片，返回 OCR 识别结果"""
     if engine is None:
         return JSONResponse(status_code=503, content={"error": "OCR 引擎尚未就绪"})
