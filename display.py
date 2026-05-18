@@ -58,9 +58,13 @@ GRADIO_SERVER_PORT = 7860
 RAW_CAMERA_FPS = 30.0
 MAX_OCR_WORKERS = 4
 REALTIME_MAX_CHIPS = 3
-OCR_MAX_IMAGE_SIDE = 512
+OCR_MAX_IMAGE_SIDE = 320
 PREVIEW_MAX_IMAGE_SIDE = 1280
 OCR_CACHE_IOU_THRESHOLD = 0.72
+CHIP_FINGERPRINT_SIZE = (96, 32)
+CHIP_FINGERPRINT_MEAN_THRESHOLD = 3.0
+CHIP_FINGERPRINT_PIXEL_THRESHOLD = 14
+CHIP_FINGERPRINT_CHANGED_RATIO_THRESHOLD = 0.03
 FRAME_DIFF_WIDTH = 160
 FRAME_DIFF_MEAN_THRESHOLD = 2.5
 FRAME_DIFF_PIXEL_THRESHOLD = 12
@@ -201,19 +205,21 @@ def stop_ocr_service_for_ui(*args, **kwargs) -> dict[str, str]:
 
 
 def normalize_frame_request(
-    frame_payload: Any, enabled: bool = True, allow_cache: bool = True
+    frame_payload: Any, enabled: bool = True, frame_stable: bool = False
 ) -> tuple[str, bool, bool]:
     """兼容 Gradio HTML server function 对多参数的打包方式。"""
     payload = frame_payload
     request_enabled = enabled
-    request_allow_cache = allow_cache
+    request_frame_stable = frame_stable
 
     for _ in range(4):
         if isinstance(payload, dict):
             if "enabled" in payload:
                 request_enabled = bool(payload["enabled"])
+            if "frame_stable" in payload:
+                request_frame_stable = bool(payload["frame_stable"])
             if "allow_cache" in payload:
-                request_allow_cache = bool(payload["allow_cache"])
+                request_frame_stable = bool(payload["allow_cache"])
             if "data_url" in payload:
                 payload = payload["data_url"]
                 continue
@@ -231,7 +237,7 @@ def normalize_frame_request(
             if len(payload) >= 2:
                 request_enabled = bool(payload[1])
             if len(payload) >= 3:
-                request_allow_cache = bool(payload[2])
+                request_frame_stable = bool(payload[2])
             payload = payload[0]
             continue
 
@@ -240,7 +246,7 @@ def normalize_frame_request(
     if not isinstance(payload, str):
         raise ValueError(f"摄像头帧格式无效：收到 {type(payload).__name__}")
 
-    return payload, request_enabled, request_allow_cache
+    return payload, request_enabled, request_frame_stable
 
 
 def data_url_to_rgb(data_url: str) -> np.ndarray:
@@ -313,6 +319,49 @@ def rect_dict_from_chip(chip: SegmentedChip) -> dict[str, int]:
     return {"x": x, "y": y, "w": w, "h": h}
 
 
+def box_points_payload(chip: SegmentedChip) -> list[dict[str, int]]:
+    return [{"x": px, "y": py} for px, py in chip.box_points]
+
+
+def chip_fingerprint(image: np.ndarray) -> np.ndarray:
+    if image.ndim == 2:
+        gray = image
+    elif image.ndim == 3 and image.shape[2] == 1:
+        gray = image[:, :, 0]
+    elif image.ndim == 3 and image.shape[2] == 3:
+        gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    else:
+        raise ValueError(f"不支持的芯片图像形状: {image.shape}")
+
+    return cv2.resize(
+        gray,
+        CHIP_FINGERPRINT_SIZE,
+        interpolation=cv2.INTER_AREA,
+    )
+
+
+def fingerprint_difference(
+    current: np.ndarray,
+    cached: np.ndarray,
+) -> tuple[float, float]:
+    if current.shape != cached.shape:
+        return float("inf"), 1.0
+
+    delta = cv2.absdiff(current, cached)
+    mean_delta = float(delta.mean())
+    changed_ratio = float(
+        np.count_nonzero(delta > CHIP_FINGERPRINT_PIXEL_THRESHOLD) / delta.size
+    )
+    return mean_delta, changed_ratio
+
+
+def is_fingerprint_stable(mean_delta: float, changed_ratio: float) -> bool:
+    return (
+        mean_delta < CHIP_FINGERPRINT_MEAN_THRESHOLD
+        and changed_ratio < CHIP_FINGERPRINT_CHANGED_RATIO_THRESHOLD
+    )
+
+
 def draw_chip_boxes(image: np.ndarray, chips: list[SegmentedChip]) -> np.ndarray:
     annotated = image.copy()
     line_width = max(2, min(image.shape[:2]) // 280)
@@ -369,7 +418,7 @@ def chip_result_payload(
     return {
         "index": index,
         "rect": rect_dict_from_chip(chip),
-        "box_points": [{"x": px, "y": py} for px, py in chip.box_points],
+        "box_points": box_points_payload(chip),
         "angle": chip.angle,
         "segment_score": chip.score,
         "segment_source": chip.source,
@@ -386,11 +435,14 @@ def cached_chip_result_payload(
     cached_entry: dict[str, Any],
     *,
     cache_age_ms: float,
+    cache_iou: float,
+    fingerprint_mean_delta: float,
+    fingerprint_changed_ratio: float,
 ) -> dict[str, Any]:
     return {
         "index": index,
         "rect": rect_dict_from_chip(chip),
-        "box_points": [{"x": px, "y": py} for px, py in chip.box_points],
+        "box_points": box_points_payload(chip),
         "angle": chip.angle,
         "segment_score": chip.score,
         "segment_source": chip.source,
@@ -402,6 +454,9 @@ def cached_chip_result_payload(
         "timings": {
             "ocr_wall_ms": 0.0,
             "cache_age_ms": cache_age_ms,
+            "cache_iou": round(cache_iou, 4),
+            "fingerprint_mean_delta": round(fingerprint_mean_delta, 3),
+            "fingerprint_changed_ratio": round(fingerprint_changed_ratio, 4),
             "cached": True,
         },
     }
@@ -442,29 +497,58 @@ def cached_results_for_chips(
 
     results: dict[int, dict[str, Any]] = {}
     used_cache_indexes: set[int] = set()
+    track_updates: list[tuple[int, SegmentedChip, np.ndarray]] = []
     for index, chip in enumerate(chips, start=1):
         rect = rect_dict_from_chip(chip)
+        fingerprint = chip_fingerprint(chip.image)
         best_index: int | None = None
         best_iou = 0.0
+        best_mean_delta = float("inf")
+        best_changed_ratio = 1.0
         for cache_index, entry in enumerate(entries):
             if cache_index in used_cache_indexes:
                 continue
             iou = rect_iou_dict(rect, entry["rect"])
+            if iou < OCR_CACHE_IOU_THRESHOLD:
+                continue
+            mean_delta, changed_ratio = fingerprint_difference(
+                fingerprint, entry["fingerprint"]
+            )
+            if not is_fingerprint_stable(mean_delta, changed_ratio):
+                continue
             if iou > best_iou:
                 best_iou = iou
                 best_index = cache_index
+                best_mean_delta = mean_delta
+                best_changed_ratio = changed_ratio
 
-        if best_index is None or best_iou < OCR_CACHE_IOU_THRESHOLD:
+        if best_index is None:
             continue
 
         used_cache_indexes.add(best_index)
-        cache_age_ms = round((now - float(entries[best_index]["stored_at"])) * 1000, 2)
+        track_updates.append((best_index, chip, fingerprint))
+        cache_age_ms = round(
+            (now - float(entries[best_index]["recognized_at"])) * 1000, 2
+        )
         results[index] = cached_chip_result_payload(
             index,
             chip,
             entries[best_index],
             cache_age_ms=cache_age_ms,
+            cache_iou=best_iou,
+            fingerprint_mean_delta=best_mean_delta,
+            fingerprint_changed_ratio=best_changed_ratio,
         )
+
+    if track_updates:
+        with ocr_cache_lock:
+            for cache_index, chip, fingerprint in track_updates:
+                if cache_index >= len(ocr_result_cache):
+                    continue
+                ocr_result_cache[cache_index]["rect"] = rect_dict_from_chip(chip)
+                ocr_result_cache[cache_index]["box_points"] = box_points_payload(chip)
+                ocr_result_cache[cache_index]["fingerprint"] = fingerprint.copy()
+                ocr_result_cache[cache_index]["updated_at"] = now
 
     return results
 
@@ -473,29 +557,38 @@ def cache_ocr_result(chip: SegmentedChip, result: dict[str, Any]) -> None:
     if not result.get("match", {}).get("part_number"):
         return
 
+    now = time.monotonic()
     entry = {
         "rect": rect_dict_from_chip(chip),
+        "box_points": box_points_payload(chip),
+        "fingerprint": chip_fingerprint(chip.image),
         "texts": copy.deepcopy(result.get("texts", [])),
         "match": copy.deepcopy(result.get("match", {})),
         "inference_time_ms": result.get("inference_time_ms"),
-        "stored_at": time.monotonic(),
+        "recognized_at": now,
+        "updated_at": now,
     }
     with ocr_cache_lock:
-        ocr_result_cache.append(entry)
+        best_index: int | None = None
+        best_iou = 0.0
+        for cache_index, existing in enumerate(ocr_result_cache):
+            iou = rect_iou_dict(entry["rect"], existing["rect"])
+            if iou > best_iou:
+                best_iou = iou
+                best_index = cache_index
+
+        if best_index is not None and best_iou >= OCR_CACHE_IOU_THRESHOLD:
+            ocr_result_cache[best_index] = entry
+        else:
+            ocr_result_cache.append(entry)
         ocr_result_cache[:] = ocr_result_cache[-REALTIME_MAX_CHIPS:]
 
 
-def recognize_chips_with_cache(
-    chips: list[SegmentedChip], *, allow_cache: bool = True
-) -> list[dict[str, Any]]:
+def recognize_chips_with_cache(chips: list[SegmentedChip]) -> list[dict[str, Any]]:
     if not chips:
         return []
 
-    if allow_cache:
-        results_by_index = cached_results_for_chips(chips)
-    else:
-        clear_ocr_result_cache()
-        results_by_index = {}
+    results_by_index = cached_results_for_chips(chips)
     chips_to_recognize = [
         (index, chip)
         for index, chip in enumerate(chips, start=1)
@@ -521,7 +614,7 @@ def recognize_chips_with_cache(
 
 
 def recognize_multi_chip_frame(
-    data_url: Any, enabled: bool = True, allow_cache: bool = True
+    data_url: Any, enabled: bool = True, frame_stable: bool = False
 ) -> dict[str, Any]:
     started_at = time.perf_counter()
     timings: dict[str, Any] = {}
@@ -544,10 +637,11 @@ def recognize_multi_chip_frame(
 
     try:
         step_started = time.perf_counter()
-        data_url, enabled, allow_cache = normalize_frame_request(
-            data_url, enabled, allow_cache
+        data_url, enabled, frame_stable = normalize_frame_request(
+            data_url, enabled, frame_stable
         )
         timings["request_ms"] = elapsed_ms(step_started)
+        timings["frame_stable"] = frame_stable
     except ValueError as exc:
         return finish(status=f"摄像头帧无效：{exc}", summary="未完成识别")
 
@@ -615,7 +709,7 @@ def recognize_multi_chip_frame(
     timings["service_ms"] = elapsed_ms(step_started)
 
     step_started = time.perf_counter()
-    chip_results = recognize_chips_with_cache(chips, allow_cache=allow_cache)
+    chip_results = recognize_chips_with_cache(chips)
     timings["ocr_ms"] = elapsed_ms(step_started)
     cached_count = sum(1 for item in chip_results if item.get("cached"))
     timings["cache_hits"] = cached_count

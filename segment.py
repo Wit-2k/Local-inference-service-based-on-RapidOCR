@@ -23,6 +23,11 @@ REALTIME_DARK_CLOSE_KERNELS: tuple[tuple[int, int], ...] = ((9, 9), (21, 11))
 MIN_DARK_RATIO = 0.22
 MIN_CENTER_BORDER_CONTRAST = 25.0
 MAX_BORDER_TOUCHING_AREA_RATIO = 0.08
+SHADOW_BORDER_AREA_RATIO = 0.035
+SHADOW_EDGE_DENSITY_THRESHOLD = 0.025
+SHADOW_ROI_STD_THRESHOLD = 24.0
+SHADOW_CENTER_CONTRAST_THRESHOLD = 35.0
+SHADOW_EXTREME_ASPECT_RATIO = 5.5
 
 
 @dataclass(frozen=True)
@@ -356,6 +361,16 @@ def rect_touches_border(
     )
 
 
+def rect_touches_right_or_bottom(
+    rect: Rect, image_shape: tuple[int, int], margin_ratio: float = 0.01
+) -> bool:
+    x, y, w, h = rect
+    image_h, image_w = image_shape[:2]
+    margin_x = max(1, int(round(image_w * margin_ratio)))
+    margin_y = max(1, int(round(image_h * margin_ratio)))
+    return x + w >= image_w - margin_x or y + h >= image_h - margin_y
+
+
 def contour_shapes(mask: np.ndarray) -> Iterable[tuple[np.ndarray, float]]:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for contour in contours:
@@ -469,6 +484,43 @@ def score_plausible_chip(
     return score
 
 
+def is_shadow_like_candidate(
+    gray: np.ndarray,
+    rect: Rect,
+    rotated_size: tuple[float, float],
+    *,
+    area_ratio: float,
+) -> bool:
+    if area_ratio <= SHADOW_BORDER_AREA_RATIO:
+        return False
+    if not rect_touches_right_or_bottom(rect, gray.shape):
+        return False
+
+    x, y, w, h = rect
+    roi = gray[y : y + h, x : x + w]
+    if roi.size == 0:
+        return False
+
+    _, _, contrast, edge_density = score_rect(gray, rect)
+    texture_std = float(roi.std())
+    rw = max(float(rotated_size[0]), 1.0)
+    rh = max(float(rotated_size[1]), 1.0)
+    aspect_ratio = max(rw / rh, rh / rw)
+
+    low_detail = (
+        edge_density < SHADOW_EDGE_DENSITY_THRESHOLD
+        and texture_std < SHADOW_ROI_STD_THRESHOLD
+        and contrast < SHADOW_CENTER_CONTRAST_THRESHOLD
+    )
+    smooth_extreme_rect = (
+        aspect_ratio > SHADOW_EXTREME_ASPECT_RATIO
+        and edge_density < SHADOW_EDGE_DENSITY_THRESHOLD * 1.6
+        and texture_std < SHADOW_ROI_STD_THRESHOLD * 1.25
+        and contrast < SHADOW_CENTER_CONTRAST_THRESHOLD * 1.5
+    )
+    return low_detail or smooth_extreme_rect
+
+
 def sort_rects_reading_order(candidates: list[ChipCandidate]) -> list[ChipCandidate]:
     if not candidates:
         return []
@@ -548,6 +600,13 @@ def find_chip_candidates(
             if (
                 rect_touches_border(clipped_rect, gray.shape)
                 and area_ratio > MAX_BORDER_TOUCHING_AREA_RATIO
+            ):
+                continue
+            if is_shadow_like_candidate(
+                gray,
+                clipped_rect,
+                rotated_size,
+                area_ratio=area_ratio,
             ):
                 continue
 

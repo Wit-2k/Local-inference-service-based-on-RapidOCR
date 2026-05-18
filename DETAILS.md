@@ -101,7 +101,7 @@ Gradio 页面入口和实时识别总控。
 - 把摄像头流挂到 `<video>`，左侧连续预览。
 - 按 `DEFAULT_CAPTURE_INTERVAL_SECONDS` 定时对 `<video>` 做低分辨率帧差。
 - 需要识别时，把 `<video>` 画到隐藏 canvas，并用 `canvas.toDataURL("image/jpeg", quality)` 得到 JPEG Data URL。
-- 调用后端 `recognize_multi_chip_frame()`，同时传入本帧是否稳定，供后端决定是否允许 OCR 缓存复用。
+- 调用后端 `recognize_multi_chip_frame()`，同时传入本帧是否稳定，供后端记录本次抽帧状态。
 - 渲染右侧识别框预览、结果卡片和成功识别历史。
 
 注意：左侧原始流由浏览器直接显示，理论上可以接近摄像头实时帧率；OCR 识别是按固定间隔抽帧，不是 30fps。
@@ -365,7 +365,9 @@ segment_array_with_metadata(frame_rgb, input_color="rgb")
 
 ### 步骤 8：OCR 请求、缓存和服务端排队
 
-如果检测到多个芯片，`display.py` 会用线程池并发发起 OCR 请求：
+如果检测到多个芯片，`display.py` 会先尝试按单芯片 track 复用已成功匹配的 OCR 结果。只有新出现、位置变化过大、芯片图像指纹变化明显，或上一次没有匹配到型号的芯片，才会真实发起 OCR 请求。
+
+需要真实 OCR 的芯片会用线程池并发发起请求：
 
 ```python
 max_workers = min(4, chip_count)
@@ -381,7 +383,7 @@ recognize_array(chip.image, save_path=None)
 
 这里的并发是客户端并发请求，不代表服务端会并发推理。当前 `ocr_server.py` 是单个 FastAPI 进程、单个 uvicorn worker、单个全局 RapidOCR engine。`/ocr` 入口虽然是 `async def`，但内部会同步调用 `engine(img)`。因此多个 OCR 请求到达服务端后通常会排队执行。页面状态中的 `OCR xxx ms` 是客户端等待墙钟时间，包含 HTTP 往返、服务端排队等待和实际 RapidOCR 推理时间；三芯片场景下它可能接近多个真实 OCR 请求耗时之和。
 
-后端还有一层按芯片框复用 OCR 结果的缓存。默认策略是：前端判断本帧仍然稳定、当前芯片框和缓存框重叠度足够高、且上一次已经匹配到型号时，复用该芯片的 OCR 文本和型号匹配结果。未匹配成功的芯片不会缓存，下一帧会继续真实 OCR。只要前端帧差判断到画面有明显变化，后端就会跳过旧缓存、重新真实 OCR 并刷新缓存，避免同一位置更换芯片时复用旧型号。
+后端还有一层单芯片 track 缓存。默认策略是：当前芯片框和历史 track 的重叠度足够高、芯片裁剪图的小尺寸灰度指纹变化足够小、且历史结果已经匹配到型号时，复用该芯片的 OCR 文本和型号匹配结果。缓存命中后，track 会跟随当前芯片框和图像指纹更新；未匹配成功的芯片不会缓存，下一帧会继续真实 OCR。同一位置更换芯片时，图像指纹差异会阻止复用旧型号。
 
 实时流程不会保存每个芯片裁剪图，也不会保存 `result.json`。
 
@@ -527,8 +529,11 @@ uv run python segment.py images/fourth.jpg chip_crop.jpg --debug
 - `padding_ratio`：旋转框外扩比例。
 - `DARK_CLOSE_KERNELS`：暗区闭运算核尺寸。
 - `EDGE_CLOSE_KERNELS`：边缘闭运算核尺寸。
+- `SHADOW_*`：贴近画面边缘的大块低纹理阴影过滤阈值。
 
 如果大芯片只框到引脚，通常要看暗区闭运算是否把主体连起来，或候选评分是否偏向局部高对比区域。
+
+如果把摄像头、手机或灯架的阴影误框成芯片，常见特征是：候选框贴近画面右边或下边、面积较大、内部纹理平滑、边缘密度很低。此时优先调整光照和摆位，让阴影离开识别区域；代码里的 `is_shadow_like_candidate()` 会作为兜底过滤这类贴边阴影。
 
 ### OCR 文本问题
 
@@ -595,6 +600,10 @@ REALTIME_MAX_CHIPS
 OCR_MAX_IMAGE_SIDE
 PREVIEW_MAX_IMAGE_SIDE
 OCR_CACHE_IOU_THRESHOLD
+CHIP_FINGERPRINT_SIZE
+CHIP_FINGERPRINT_MEAN_THRESHOLD
+CHIP_FINGERPRINT_PIXEL_THRESHOLD
+CHIP_FINGERPRINT_CHANGED_RATIO_THRESHOLD
 FRAME_DIFF_WIDTH
 FRAME_DIFF_MEAN_THRESHOLD
 FRAME_DIFF_PIXEL_THRESHOLD
@@ -606,7 +615,7 @@ FRAME_DIFF_CHANGED_RATIO_THRESHOLD
 注意这里有两种不同的“复用”：
 
 - 前端帧差复用：整帧画面稳定且上一帧所有芯片都已匹配型号时，直接不调用后端，省掉上传、解码、分割、OCR 和预览图编码；只要仍有芯片未匹配成功，就继续调用后端。
-- 后端 OCR 缓存复用：画面已经进入后端分割后，只在前端帧差认为画面稳定时，对位置稳定且已匹配型号的单个芯片复用 OCR 结果；没有命中的芯片仍会真实 OCR。若画面发生明显变化，后端会清空旧缓存并重新识别当前芯片。
+- 后端单芯片 track 复用：画面已经进入后端分割后，逐个芯片比较位置和图像指纹。位置稳定、图像内容稳定、且历史结果已匹配型号的芯片会复用 OCR 结果；未匹配成功、新出现、明显移动或内容变化的芯片会真实 OCR。
 
 这些值会在 `build_webrtc_js()` 中注入到 `display.js`。
 
