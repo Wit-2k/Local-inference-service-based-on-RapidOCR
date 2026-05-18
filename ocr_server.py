@@ -15,6 +15,7 @@ from chip_preprocess import generate_chip_ocr_variants
 from config import LIMIT_SIDE_LEN, MODEL_TYPE
 
 APP_IMPORT_PATH = "ocr_server:app"
+PREFERRED_ENHANCE_VARIANT = "laser_dark"
 
 engine: RapidOCR | None = None
 
@@ -80,14 +81,35 @@ def recognize_image(img: np.ndarray, enhance: bool = False) -> dict[str, Any]:
         return run_ocr(img)
 
     start = time.perf_counter()
+    variants = generate_chip_ocr_variants(img)
     best_payload: dict[str, Any] | None = None
-    best_variant = "original"
+    best_variant = PREFERRED_ENHANCE_VARIANT
     best_quality = -1.0
 
-    for variant_name, variant_image in generate_chip_ocr_variants(img):
+    preferred = next(
+        (
+            (variant_name, variant_image)
+            for variant_name, variant_image in variants
+            if variant_name == PREFERRED_ENHANCE_VARIANT
+        ),
+        None,
+    )
+    if preferred is not None:
+        best_variant, preferred_image = preferred
+        best_payload = run_ocr(preferred_image)
+        best_quality = text_quality(best_payload)
+        if best_quality > 0:
+            best_payload["inference_time_ms"] = round(
+                (time.perf_counter() - start) * 1000, 2
+            )
+            best_payload["preprocess_variant"] = best_variant
+            return best_payload
+
+    for variant_name, variant_image in variants:
+        if variant_name == PREFERRED_ENHANCE_VARIANT:
+            continue
         payload = run_ocr(variant_image)
         quality = text_quality(payload)
-        print(quality)  # 用于调试
         if quality > best_quality:
             best_payload = payload
             best_variant = variant_name

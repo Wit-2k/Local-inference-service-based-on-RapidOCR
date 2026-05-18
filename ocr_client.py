@@ -247,7 +247,7 @@ def recognize(image_url: str | Path, enhance: bool = False) -> dict[str, Any]:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="调用本地 OCR 服务识别图片")
     parser.add_argument(
-        "image_path", nargs="?", default="chip_crop.jpg", help="输入图片路径"
+        "image_path", nargs="?", default=R"preprocess_variants\06_laser_dark.jpg", help="输入图片路径"
     )
     parser.add_argument(
         "--enhance",

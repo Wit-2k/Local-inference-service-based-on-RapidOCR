@@ -115,7 +115,7 @@ def save_chip_ocr_variants(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="输出芯片 OCR 预处理的七种调试变体")
     parser.add_argument(
-        "image_path", nargs="?", default="chip_crop_03.jpg", help="输入芯片图片路径"
+        "image_path", nargs="?", default=R"images\big.png", help="输入芯片图片路径"
     )
     parser.add_argument(
         "output_dir",

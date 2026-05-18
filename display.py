@@ -58,7 +58,10 @@ GRADIO_SERVER_PORT = 7860
 RAW_CAMERA_FPS = 30.0
 MAX_OCR_WORKERS = 4
 REALTIME_MAX_CHIPS = 3
-OCR_MAX_IMAGE_SIDE = 320
+OCR_MAX_IMAGE_SIDE = 512
+OCR_LARGE_CHIP_MAX_IMAGE_SIDE = 768
+OCR_LARGE_CHIP_SIDE_THRESHOLD = 560
+OCR_LARGE_CHIP_ASPECT_THRESHOLD = 3.2
 PREVIEW_MAX_IMAGE_SIDE = 1280
 OCR_CACHE_IOU_THRESHOLD = 0.72
 CHIP_FINGERPRINT_SIZE = (96, 32)
@@ -292,6 +295,28 @@ def resize_long_side(image: np.ndarray, max_side: int) -> np.ndarray:
     return cv2.resize(image, size, interpolation=cv2.INTER_AREA)
 
 
+def ocr_max_side_for_chip(image: np.ndarray) -> int:
+    h, w = image.shape[:2]
+    long_side = max(h, w)
+    short_side = max(1, min(h, w))
+    aspect_ratio = long_side / short_side
+    if (
+        long_side >= OCR_LARGE_CHIP_SIDE_THRESHOLD
+        or aspect_ratio >= OCR_LARGE_CHIP_ASPECT_THRESHOLD
+    ):
+        return OCR_LARGE_CHIP_MAX_IMAGE_SIDE
+    return OCR_MAX_IMAGE_SIDE
+
+
+def ocr_payload_has_text(payload: dict[str, Any] | None) -> bool:
+    if not payload:
+        return False
+    return any(
+        bool(str(item.get("text", "")).strip())
+        for item in payload.get("result") or []
+    )
+
+
 def rect_area_dict(rect: dict[str, int]) -> int:
     return max(0, int(rect["w"])) * max(0, int(rect["h"]))
 
@@ -464,9 +489,16 @@ def cached_chip_result_payload(
 
 def recognize_chip(index: int, chip: SegmentedChip) -> dict[str, Any]:
     started_at = time.perf_counter()
-    ocr_image = resize_long_side(chip.image, OCR_MAX_IMAGE_SIDE)
+    ocr_max_side = ocr_max_side_for_chip(chip.image)
+    ocr_image = resize_long_side(chip.image, ocr_max_side)
+    used_enhance_fallback = False
     try:
         payload = recognize_array(ocr_image, save_path=None)
+        if not ocr_payload_has_text(payload):
+            fallback_payload = recognize_array(ocr_image, save_path=None, enhance=True)
+            if ocr_payload_has_text(fallback_payload):
+                payload = fallback_payload
+                used_enhance_fallback = True
     except (
         RuntimeError,
         ValueError,
@@ -483,6 +515,9 @@ def recognize_chip(index: int, chip: SegmentedChip) -> dict[str, Any]:
         "ocr_wall_ms": elapsed_ms(started_at),
         "ocr_input_width": int(ocr_image.shape[1]),
         "ocr_input_height": int(ocr_image.shape[0]),
+        "ocr_input_max_side": ocr_max_side,
+        "ocr_enhance_fallback": used_enhance_fallback,
+        "ocr_preprocess_variant": payload.get("preprocess_variant"),
         "cached": False,
     }
     return result

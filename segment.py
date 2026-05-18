@@ -23,11 +23,17 @@ REALTIME_DARK_CLOSE_KERNELS: tuple[tuple[int, int], ...] = ((9, 9), (21, 11))
 MIN_DARK_RATIO = 0.22
 MIN_CENTER_BORDER_CONTRAST = 25.0
 MAX_BORDER_TOUCHING_AREA_RATIO = 0.08
-SHADOW_BORDER_AREA_RATIO = 0.035
+SHADOW_BORDER_AREA_RATIO = 0.015
 SHADOW_EDGE_DENSITY_THRESHOLD = 0.025
 SHADOW_ROI_STD_THRESHOLD = 24.0
 SHADOW_CENTER_CONTRAST_THRESHOLD = 35.0
 SHADOW_EXTREME_ASPECT_RATIO = 5.5
+MERGED_CANDIDATE_AREA_RATIO = 0.08
+MERGED_SPLIT_DARK_CLOSE_KERNELS: tuple[tuple[int, int], ...] = ((3, 3),)
+MERGED_SPLIT_MIN_CHILD_AREA_RATIO = 0.08
+MERGED_SPLIT_MAX_CHILD_AREA_RATIO = 0.45
+MERGED_SPLIT_MIN_SCORE = 0.25
+MERGED_SPLIT_MIN_CHILDREN = 2
 
 
 @dataclass(frozen=True)
@@ -371,6 +377,35 @@ def rect_touches_right_or_bottom(
     return x + w >= image_w - margin_x or y + h >= image_h - margin_y
 
 
+def translate_rect(rect: Rect, offset_x: int, offset_y: int) -> Rect:
+    x, y, w, h = rect
+    return x + offset_x, y + offset_y, w, h
+
+
+def translate_box_points(
+    box_points: BoxPoints, offset_x: int, offset_y: int
+) -> BoxPoints:
+    return (
+        (box_points[0][0] + offset_x, box_points[0][1] + offset_y),
+        (box_points[1][0] + offset_x, box_points[1][1] + offset_y),
+        (box_points[2][0] + offset_x, box_points[2][1] + offset_y),
+        (box_points[3][0] + offset_x, box_points[3][1] + offset_y),
+    )
+
+
+def translate_candidate(
+    candidate: ChipCandidate, offset_x: int, offset_y: int, source_prefix: str
+) -> ChipCandidate:
+    return ChipCandidate(
+        rect=translate_rect(candidate.rect, offset_x, offset_y),
+        box_points=translate_box_points(candidate.box_points, offset_x, offset_y),
+        angle=candidate.angle,
+        rotated_area=candidate.rotated_area,
+        score=candidate.score,
+        source=f"{source_prefix}:{candidate.source}",
+    )
+
+
 def contour_shapes(mask: np.ndarray) -> Iterable[tuple[np.ndarray, float]]:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     for contour in contours:
@@ -521,6 +556,41 @@ def is_shadow_like_candidate(
     return low_detail or smooth_extreme_rect
 
 
+def split_merged_candidate(
+    gray: np.ndarray,
+    candidate: ChipCandidate,
+    *,
+    image_area: float,
+) -> list[ChipCandidate]:
+    if rect_area(candidate.rect) / image_area < MERGED_CANDIDATE_AREA_RATIO:
+        return []
+
+    x, y, w, h = candidate.rect
+    roi = gray[y : y + h, x : x + w]
+    if roi.size == 0:
+        return []
+
+    local_candidates = find_chip_candidates(
+        roi,
+        min_area_ratio=MERGED_SPLIT_MIN_CHILD_AREA_RATIO,
+        max_area_ratio=MERGED_SPLIT_MAX_CHILD_AREA_RATIO,
+        max_aspect_ratio=8.0,
+        min_score=MERGED_SPLIT_MIN_SCORE,
+        padding_ratio=0.04,
+        include_edge_masks=False,
+        dark_close_kernels=MERGED_SPLIT_DARK_CLOSE_KERNELS,
+        max_chips=None,
+        split_merged_candidates=False,
+    )
+    if len(local_candidates) < MERGED_SPLIT_MIN_CHILDREN:
+        return []
+
+    return [
+        translate_candidate(local_candidate, x, y, f"split_{candidate.source}")
+        for local_candidate in local_candidates
+    ]
+
+
 def sort_rects_reading_order(candidates: list[ChipCandidate]) -> list[ChipCandidate]:
     if not candidates:
         return []
@@ -559,6 +629,7 @@ def find_chip_candidates(
     include_edge_masks: bool = True,
     dark_close_kernels: tuple[tuple[int, int], ...] = DARK_CLOSE_KERNELS,
     edge_close_kernels: tuple[tuple[int, int], ...] = EDGE_CLOSE_KERNELS,
+    split_merged_candidates: bool = True,
 ) -> list[ChipCandidate]:
     """
     检测多个芯片候选框。
@@ -610,17 +681,25 @@ def find_chip_candidates(
             ):
                 continue
 
-            rotated_area = float(rotated_size[0] * rotated_size[1])
-            candidates.append(
-                ChipCandidate(
-                    rect=clipped_rect,
-                    box_points=box_points,
-                    angle=angle,
-                    rotated_area=rotated_area,
-                    score=score,
-                    source=source,
-                )
+            candidate = ChipCandidate(
+                rect=clipped_rect,
+                box_points=box_points,
+                angle=angle,
+                rotated_area=float(rotated_size[0] * rotated_size[1]),
+                score=score,
+                source=source,
             )
+            if split_merged_candidates:
+                split_candidates = split_merged_candidate(
+                    gray,
+                    candidate,
+                    image_area=image_area,
+                )
+                if split_candidates:
+                    candidates.extend(split_candidates)
+                    continue
+
+            candidates.append(candidate)
 
     selected = non_max_suppression(candidates, iou_threshold=nms_iou_threshold)
     selected = sort_rects_reading_order(selected)

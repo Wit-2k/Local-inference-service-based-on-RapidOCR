@@ -171,7 +171,7 @@ OCR 参数来自 `config.py`：
 - `result`
 - 每个文本项的 `box`、`text`、`score`
 
-如果请求参数 `enhance=true`，会调用 `chip_preprocess.py` 生成多种预处理变体，并选取得分最高的 OCR 结果。
+如果请求参数 `enhance=true`，会优先使用 `chip_preprocess.py` 生成的 `laser_dark` 变体；只有它没有识别出有效文本时，才会尝试其他预处理变体并选取得分最高的 OCR 结果。
 
 ### `ocr_client.py`
 
@@ -379,7 +379,7 @@ max_workers = min(4, chip_count)
 recognize_array(chip.image, save_path=None)
 ```
 
-实时链路会先把送 OCR 的芯片裁剪图按最长边限制缩放，避免大芯片裁剪图把 RapidOCR 耗时拉得过高。右侧识别框预览也会按最长边限制缩放后再返回前端。
+实时链路会先按芯片尺寸选择 OCR 输入上限：普通芯片使用 `OCR_MAX_IMAGE_SIDE`，大芯片或长宽比较大的芯片使用 `OCR_LARGE_CHIP_MAX_IMAGE_SIDE`，避免大芯片激光字被压得太小。若普通 OCR 没有返回任何文本，会再用 `enhance=True` 触发增强兜底；增强流程先跑 `laser_dark`，失败后才从其他变体中选最高分。右侧识别框预览也会按最长边限制缩放后再返回前端。
 
 这里的并发是客户端并发请求，不代表服务端会并发推理。当前 `ocr_server.py` 是单个 FastAPI 进程、单个 uvicorn worker、单个全局 RapidOCR engine。`/ocr` 入口虽然是 `async def`，但内部会同步调用 `engine(img)`。因此多个 OCR 请求到达服务端后通常会排队执行。页面状态中的 `OCR xxx ms` 是客户端等待墙钟时间，包含 HTTP 往返、服务端排队等待和实际 RapidOCR 推理时间；三芯片场景下它可能接近多个真实 OCR 请求耗时之和。
 
@@ -530,10 +530,13 @@ uv run python segment.py images/fourth.jpg chip_crop.jpg --debug
 - `DARK_CLOSE_KERNELS`：暗区闭运算核尺寸。
 - `EDGE_CLOSE_KERNELS`：边缘闭运算核尺寸。
 - `SHADOW_*`：贴近画面边缘的大块低纹理阴影过滤阈值。
+- `MERGED_*`：大候选内部二次分割阈值，用于拆开距离太近而被暗区连成一块的多芯片。
 
 如果大芯片只框到引脚，通常要看暗区闭运算是否把主体连起来，或候选评分是否偏向局部高对比区域。
 
 如果把摄像头、手机或灯架的阴影误框成芯片，常见特征是：候选框贴近画面右边或下边、面积较大、内部纹理平滑、边缘密度很低。此时优先调整光照和摆位，让阴影离开识别区域；代码里的 `is_shadow_like_candidate()` 会作为兜底过滤这类贴边阴影。
+
+如果两个芯片靠得太近被框成一个大框，通常是引脚阴影和暗区闭运算把两块芯片连在一起。`split_merged_candidate()` 会在大候选内部用更弱的闭运算做二次分割；实际拍摄时仍建议芯片之间留出明显空隙。
 
 ### OCR 文本问题
 
@@ -551,7 +554,7 @@ uv run python chip_preprocess.py chip_crop_03.jpg preprocess_variants/
 
 查看七种预处理图，判断文字在哪种图上最清楚。
 
-如果某种预处理明显更好，可以考虑在 `/ocr?enhance=true` 流程里启用，或调整 `generate_chip_ocr_variants()` 的变体。
+当前 `/ocr?enhance=true` 会默认优先尝试 `laser_dark`，只有它没有识别出有效文本时才尝试其他变体。若某种预处理长期更好，可以调整 `PREFERRED_ENHANCE_VARIANT` 或 `generate_chip_ocr_variants()` 的变体。
 
 ### 型号匹配问题
 
@@ -598,6 +601,9 @@ JPEG_QUALITY
 ```python
 REALTIME_MAX_CHIPS
 OCR_MAX_IMAGE_SIDE
+OCR_LARGE_CHIP_MAX_IMAGE_SIDE
+OCR_LARGE_CHIP_SIDE_THRESHOLD
+OCR_LARGE_CHIP_ASPECT_THRESHOLD
 PREVIEW_MAX_IMAGE_SIDE
 OCR_CACHE_IOU_THRESHOLD
 CHIP_FINGERPRINT_SIZE
