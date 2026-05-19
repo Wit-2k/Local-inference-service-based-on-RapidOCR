@@ -1,4 +1,4 @@
-"""Windows desktop shell for the Gradio OCR app."""
+"""Windows desktop shell for the OCR app. Edge browser is used here."""
 
 from __future__ import annotations
 
