@@ -12,10 +12,10 @@ from fastapi.responses import JSONResponse
 from rapidocr import EngineType, LangDet, LangRec, OCRVersion, RapidOCR
 
 from chip_preprocess import generate_chip_ocr_variants
-from config import LIMIT_SIDE_LEN, MODEL_TYPE
 
 APP_IMPORT_PATH = "ocr_server:app"
 PREFERRED_ENHANCE_VARIANT = "laser_dark"
+LIMIT_SIDE_LEN = 480
 
 engine: RapidOCR | None = None
 
@@ -27,9 +27,7 @@ def build_ocr_params() -> dict[str, Any]:
             {
                 f"{prefix}.engine_type": EngineType.OPENVINO,
                 f"{prefix}.lang_type": lang,
-                f"{prefix}.model_type": MODEL_TYPE,
                 f"{prefix}.ocr_version": OCRVersion.PPOCRV5,
-                f"{prefix}.enable_hpi": True,
             }
         )
     params["Det.limit_side_len"] = LIMIT_SIDE_LEN
