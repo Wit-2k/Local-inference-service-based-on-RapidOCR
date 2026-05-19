@@ -9,9 +9,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-PROJECT_DIR = Path(__file__).resolve().parent
-DEFAULT_DB_PATH = PROJECT_DIR / "chip_rules.sqlite3"
-DEFAULT_RULES_CSV_PATH = PROJECT_DIR / "chip_rules.csv"
+from runtime_paths import editable_resource_path, writable_path
+
+PROJECT_DIR = writable_path("")
+DEFAULT_DB_PATH = writable_path("chip_rules.sqlite3")
+DEFAULT_RULES_CSV_PATH = editable_resource_path("chip_rules.csv")
 RULE_COLUMNS = ("part_number", "pattern", "description", "priority", "enabled")
 
 

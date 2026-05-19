@@ -15,8 +15,6 @@ import cv2
 import gradio as gr
 import numpy as np
 import requests
-import platform
-import signal
 
 
 from capture import (
@@ -29,8 +27,8 @@ from ocr_client import (
     ensure_ocr_service,
     is_ocr_ready,
     recognize_array,
-    shutdown_server,
 )
+from runtime_paths import resource_path
 from segment import SegmentedChip, segment_array_with_metadata
 
 LOCAL_PROXY_BYPASS = "localhost,127.0.0.1,::1"
@@ -81,10 +79,9 @@ WEBCAM_CONSTRAINTS = {
     },
     "audio": False,
 }
-UI_DIR = Path(__file__).resolve().parent
-DISPLAY_HTML_PATH = UI_DIR / "display.html"
-DISPLAY_CSS_PATH = UI_DIR / "display.css"
-DISPLAY_JS_PATH = UI_DIR / "display.js"
+DISPLAY_HTML_PATH = resource_path("display.html")
+DISPLAY_CSS_PATH = resource_path("display.css")
+DISPLAY_JS_PATH = resource_path("display.js")
 
 
 def load_text_asset(path: Path) -> str:

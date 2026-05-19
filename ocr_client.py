@@ -15,6 +15,7 @@ import numpy as np
 import requests
 
 from ocr_server import APP_IMPORT_PATH
+from runtime_paths import app_base_dir, bundled_executable_path, writable_path
 
 LOCAL_PROXY_BYPASS = "localhost,127.0.0.1,::1"
 
@@ -41,8 +42,8 @@ HEALTH_URL = f"{BASE_URL}/health"
 OCR_URL = f"{BASE_URL}/ocr"
 SHUTDOWN_URL = f"{BASE_URL}/shutdown"
 PORT = 8000
-PROJECT_DIR = Path(__file__).resolve().parent
-RESULT_PATH = PROJECT_DIR / "result.json"
+PROJECT_DIR = app_base_dir()
+RESULT_PATH = writable_path("result.json")
 
 
 def is_port_in_use(port: int) -> bool:
@@ -82,19 +83,26 @@ def wait_for_server(max_retries: int = 30, interval: float = 1.0) -> bool:
 
 def start_server(host: str = "0.0.0.0", port: int = PORT) -> subprocess.Popen:
     """启动 OCR FastAPI 服务进程，并返回进程句柄。"""
-    command = [
-        sys.executable,
-        "-m",
-        "uvicorn",
-        APP_IMPORT_PATH,
-        "--host",
-        host,
-        "--port",
-        str(port),
-    ]
+    sidecar_exe = bundled_executable_path("ocr_server")
+    if sidecar_exe is not None:
+        command = [str(sidecar_exe), "--host", host, "--port", str(port)]
+    else:
+        command = [
+            sys.executable,
+            "-m",
+            "uvicorn",
+            APP_IMPORT_PATH,
+            "--host",
+            host,
+            "--port",
+            str(port),
+        ]
     process_options: dict[str, Any] = {"cwd": PROJECT_DIR}
     if sys.platform.startswith("win"):
-        process_options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+        if sidecar_exe is not None and hasattr(subprocess, "CREATE_NO_WINDOW"):
+            creationflags |= subprocess.CREATE_NO_WINDOW
+        process_options["creationflags"] = creationflags
     return subprocess.Popen(command, **process_options)
 
 
