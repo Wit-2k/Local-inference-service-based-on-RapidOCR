@@ -1,6 +1,6 @@
 part_number,pattern,description,priority,enabled
-SN74LS00N,74[0-9A-Z]{2}[0O]{2},Quad 2-input NAND gate,10,1
-SN74LS266N,74[0-9A-Z]{2}266,4-bit synchronous binary counter,10,1
-SN74LS138N,74[0-9A-Z]{2}138,3-to-8 line decoder,10,1
-SN74LS161N,74[0-9A-Z]{2}161,4-bit synchronous up/down counter,10,1
+SN74LS00N,[7Z]4[0-9A-Z]{2}[0O]{2},Quad 2-input NAND gate,10,1
+SN74LS266N,[7Z]4[0-9A-Z]{2}266,4-bit synchronous binary counter,10,1
+SN74LS138N,[7Z]4[0-9A-Z]{2}138,3-to-8 line decoder,10,1
+SN74LS161N,[7Z]4[0-9A-Z]{2}161,4-bit synchronous up/down counter,10,1
 STC89C52RC,89C52,8051 microcontroller,10,1
