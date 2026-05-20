@@ -12,8 +12,6 @@ PaddleOCR 的部署十分麻烦且极易失败，因此选择 RapidOCR 封装的
 
 `ocr_server.py` 为 OCR FastAPI 后端服务。
 
-`config.py` 为配置文件，指定 `MODEL_TYPE` `LIMIT_SIDE_LEN` 两项参数。
-
 `ocr_client.py` 为 OCR 请求客户端，可启动/检测本地 8000 端口服务并提交图片识别。
 
 `display.py` 为 Gradio 实时页面，复用 `capture.py` 的 OpenCV 摄像头取帧方式，显示实时画面、OCR 检测框和 `result.json` 同构识别结果；识别过程不再保存临时截图文件。
