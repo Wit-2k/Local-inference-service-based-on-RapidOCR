@@ -16,12 +16,10 @@ import gradio as gr
 import numpy as np
 import requests
 
+DEFAULT_CAPTURE_INTERVAL_SECONDS = 1.0
+DEFAULT_FRAME_HEIGHT = 1440
+DEFAULT_FRAME_WIDTH = 2560
 
-from capture import (
-    DEFAULT_CAPTURE_INTERVAL_SECONDS,
-    DEFAULT_FRAME_HEIGHT,
-    DEFAULT_FRAME_WIDTH,
-)
 from chip_db import match_ocr_payload
 from ocr_client import (
     ensure_ocr_service,
