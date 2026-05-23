@@ -31,6 +31,17 @@ def build_ocr_params() -> dict[str, Any]:
             }
         )
     params["Det.limit_side_len"] = LIMIT_SIDE_LEN
+
+    prefix = "EngineConfig.openvino"
+    params.update(
+        {
+            f"{prefix}.performance_hint": "LATENCY",
+            f"{prefix}.num_streams": 1,
+            f"{prefix}.inference_num_threads": 4,
+            f"{prefix}.enable_hyper_threading": False,
+        }
+    )
+
     return params
 
 
@@ -159,8 +170,8 @@ async def shutdown(request: Request):
         return JSONResponse(status_code=403, content={"error": "只允许本机关闭"})
 
     def stop_process() -> None:
-        time.sleep(0.3)          # 等待 HTTP 响应发出
-        os._exit(0)              # ✅ 跨平台可靠，直接退出
+        time.sleep(0.3)  # 等待 HTTP 响应发出
+        os._exit(0)  # ✅ 跨平台可靠，直接退出
 
     threading.Thread(target=stop_process, daemon=True).start()
     return {"status": "shutting_down"}
