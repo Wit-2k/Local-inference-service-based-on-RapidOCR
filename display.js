@@ -116,6 +116,49 @@ function formatRecordTime(date) {
     });
 }
 
+function formatDurationMs(value) {
+    const number = Number(value);
+    if (!Number.isFinite(number)) return '--';
+    return `${number.toFixed(2)} ms`;
+}
+
+function addHistoryTiming(parent, payload) {
+    const timings = payload.timings || {};
+    const timingWrap = document.createElement('div');
+    timingWrap.className = 'history-timing';
+
+    const summary = document.createElement('div');
+    summary.className = 'history-timing-summary';
+    addText(summary, 'span', `总耗时 ${formatDurationMs(timings.total_ms)}`);
+    addText(summary, 'span', `分割 ${formatDurationMs(timings.segment_ms)}`);
+    addText(summary, 'span', `OCR ${formatDurationMs(timings.ocr_ms)}`);
+    timingWrap.appendChild(summary);
+
+    const chips = payload.chips || [];
+    if (chips.length) {
+        const chipTimes = document.createElement('div');
+        chipTimes.className = 'history-chip-times';
+        for (const chip of chips) {
+            const chipTimings = chip.timings || {};
+            const match = chip.match || {};
+            const model = match.part_number ? ` ${match.part_number}` : '';
+            let text = `芯片 ${chip.index}${model}：`;
+            if (chip.cached) {
+                text += '复用';
+                if (chipTimings.cache_age_ms != null) {
+                    text += `，缓存 ${formatDurationMs(chipTimings.cache_age_ms)} 前`;
+                }
+            } else {
+                text += `OCR ${formatDurationMs(chipTimings.ocr_wall_ms)}`;
+            }
+            addText(chipTimes, 'div', text, 'history-chip-time');
+        }
+        timingWrap.appendChild(chipTimes);
+    }
+
+    parent.appendChild(timingWrap);
+}
+
 function updateHistorySummary() {
     const count = historyEl.querySelectorAll('.history-record').length;
     historySummaryEl.textContent = `${count} 条记录`;
@@ -146,12 +189,17 @@ function appendMatchedHistory(payload) {
     image.src = payload.annotated_image;
     record.appendChild(image);
 
+    const details = document.createElement('div');
+    details.className = 'history-details';
+
     const modelWrap = document.createElement('div');
     modelWrap.className = 'history-models';
     for (const model of models) {
         addText(modelWrap, 'span', model, 'model-pill');
     }
-    record.appendChild(modelWrap);
+    details.appendChild(modelWrap);
+    addHistoryTiming(details, payload);
+    record.appendChild(details);
 
     addText(record, 'time', formatRecordTime(new Date(now)), 'history-time');
     historyEl.prepend(record);

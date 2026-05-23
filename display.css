@@ -176,7 +176,7 @@
     text-align: center;
 }
 #chip-ocr-app .history-record {
-    align-items: center;
+    align-items: start;
     border: 1px solid #d8e0dd;
     border-radius: 8px;
     display: grid;
@@ -191,6 +191,11 @@
     object-fit: cover;
     width: 100%;
 }
+#chip-ocr-app .history-details {
+    display: grid;
+    gap: 8px;
+    min-width: 0;
+}
 #chip-ocr-app .history-models {
     align-items: center;
     display: flex;
@@ -204,6 +209,29 @@
     color: #9a3412;
     font-weight: 800;
     padding: 6px 10px;
+}
+#chip-ocr-app .history-timing {
+    color: #54615d;
+    display: grid;
+    font-size: 13px;
+    gap: 6px;
+    line-height: 1.45;
+}
+#chip-ocr-app .history-timing-summary {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 12px;
+}
+#chip-ocr-app .history-timing-summary span,
+#chip-ocr-app .history-chip-time {
+    overflow-wrap: anywhere;
+}
+#chip-ocr-app .history-chip-times {
+    display: grid;
+    gap: 3px;
+}
+#chip-ocr-app .history-chip-time {
+    font-family: Consolas, 'Cascadia Mono', 'Microsoft YaHei', monospace;
 }
 #chip-ocr-app .history-time {
     color: #54615d;
