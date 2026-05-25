@@ -172,8 +172,10 @@ def stop_background_service() -> tuple[str, bool]:
             return "停止失败：端口 8000 仍被占用", False
         return "OCR 服务已停止，端口 8000 已释放", False
 
+
 def _is_port_in_use(port: int) -> bool:
     import socket
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
@@ -183,14 +185,18 @@ def _kill_by_port(port: int):
     try:
         result = subprocess.run(
             ["netstat", "-ano", "-p", "TCP"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
         for line in result.stdout.splitlines():
             if f":{port}" in line and "LISTENING" in line:
                 pid = line.split()[-1]
                 r = subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", pid],
-                    capture_output=True, text=True, timeout=10,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
                 )
     except Exception as e:
         print(f"[kill_by_port] 异常: {e}")
