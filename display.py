@@ -681,7 +681,7 @@ def recognize_multi_chip_frame(
         chips = segment_array_with_metadata(
             frame_rgb,
             input_color="rgb",
-            max_chips=REALTIME_MAX_CHIPS,
+            # max_chips=REALTIME_MAX_CHIPS,
             realtime=True,
         )
         timings["segment_ms"] = elapsed_ms(step_started)

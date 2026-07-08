@@ -4,3 +4,4 @@ SN74LS266N,[7Z]4[Ll1S5]{2}266,4-bit synchronous binary counter,10,1
 SN74LS138N,[7Z]4[Ll1S5]{2}138,3-to-8 line decoder,10,1
 SN74LS161N,[7Z]4[Ll1S5]{2}161,4-bit synchronous up/down counter,10,1
 STC89C52RC,89C52,8051 microcontroller,10,1
+SN74LS373N,[7Z]4[Ll1S5]{2}373,Octal D-Type Latch,10,1

@@ -29,3 +29,6 @@ TODO.md
 
 my_log.py
 test.py
+
+.claude/
+.agents/

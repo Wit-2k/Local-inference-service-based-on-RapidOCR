@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, File, Request, UploadFile
 from fastapi.responses import JSONResponse
-from rapidocr import EngineType, LangDet, LangRec, OCRVersion, RapidOCR
+from rapidocr import EngineType, LangDet, LangRec, ModelType, OCRVersion, RapidOCR
 
 from chip_preprocess import generate_chip_ocr_variants
 
@@ -27,7 +27,8 @@ def build_ocr_params() -> dict[str, Any]:
             {
                 f"{prefix}.engine_type": EngineType.OPENVINO,
                 f"{prefix}.lang_type": lang,
-                f"{prefix}.ocr_version": OCRVersion.PPOCRV5,
+                f"{prefix}.ocr_version": OCRVersion.PPOCRV6,
+                f"{prefix}.model_type": ModelType.SMALL,
             }
         )
     params["Det.limit_side_len"] = LIMIT_SIDE_LEN
