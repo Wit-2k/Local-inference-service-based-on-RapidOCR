@@ -1,12 +1,8 @@
-# 🔬 ChipOCR — 基于 RapidOCR 的本地实时芯片识别系统
+﻿# 🔬 ChipOCR — 基于 RapidOCR 的本地实时芯片识别系统
 
 > 使用浏览器摄像头实时识别芯片型号，纯 OpenCV 分割 + RapidOCR 推理，无需部署 PaddleOCR。
 
-![Python](https://img.shields.io/badge/Python-3.14-blue?logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.135+-009688?logo=fastapi&logoColor=white)
-![Gradio](https://img.shields.io/badge/Gradio-6.13+-FF6B00?logo=gradio&logoColor=white)
-![OpenVINO](https://img.shields.io/badge/OpenVINO-2026+-0068B5?logo=intel&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-green)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.135+-009688?logo=fastapi&logoColor=white)![FastAPI](https://img.shields.io/badge/RapidOCR-3.8+-f44336?logo=rapidocr&logoColor=white)![Gradio](https://img.shields.io/badge/Gradio-6.13+-FF6B00?logo=gradio&logoColor=white)![OpenVINO](https://img.shields.io/badge/OpenVINO-2026+-0068B5?logo=intel&logoColor=white)![License](https://img.shields.io/badge/License-MIT-green)
 
 ---
 
